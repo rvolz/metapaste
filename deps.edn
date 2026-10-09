@@ -1,0 +1,4 @@
+{:paths ["src" "test"]
+ :deps {org.clojure/data.json {:mvn/version "2.5.2"}
+        io.github.jolt-lang/time {:git/tag "v0.0.8"
+                                  :git/sha "33c5e9831c046cfcbe68bc0c9c33e92568eaebb1"}}}

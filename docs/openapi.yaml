@@ -1,0 +1,462 @@
+openapi: 3.0.3
+info:
+  title: metapaste v2 API
+  version: "2.0.0"
+  description: >
+    Frozen API contract for metapaste v2, derived from spec §5 (items API)
+    and §8 (health/management). Errors are RFC 7807 problem+json (Q23).
+    All endpoints except /healthz, /readyz and /metrics require
+    `Authorization: Bearer <api key>` (Q25). Timestamps are UTC ISO-8601.
+servers:
+  - url: /
+paths:
+  /api/v1/items:
+    post:
+      operationId: createItem
+      summary: Create an item (Q4)
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateItemJson"
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CreateItemMultipart"
+      responses:
+        "201":
+          description: Item created.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ItemMetadata"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "401":
+          $ref: "#/components/responses/Problem"
+        "403":
+          $ref: "#/components/responses/Problem"
+        "411":
+          $ref: "#/components/responses/Problem"
+        "413":
+          $ref: "#/components/responses/Problem"
+        "415":
+          $ref: "#/components/responses/Problem"
+        "429":
+          $ref: "#/components/responses/Problem"
+    get:
+      operationId: listItems
+      summary: List item metadata (cursor pagination, Q19/Q20)
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: mime_prefix
+          in: query
+          schema: { type: string }
+        - name: created_after
+          in: query
+          schema: { type: string, format: date-time }
+        - name: created_before
+          in: query
+          schema: { type: string, format: date-time }
+        - name: include_expired
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: A page of item metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ItemMetadata"
+                  next_cursor:
+                    type: string
+                    nullable: true
+        "400":
+          $ref: "#/components/responses/Problem"
+        "401":
+          $ref: "#/components/responses/Problem"
+        "429":
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/items/{name}:
+    parameters:
+      - $ref: "#/components/parameters/ItemName"
+    get:
+      operationId: getItemMetadata
+      summary: Read item metadata (404 for unknown or expired, Q38)
+      responses:
+        "200":
+          description: Item metadata.
+          headers:
+            ETag:
+              description: "SHA-256 ETag of the content."
+              schema: { type: string }
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ItemMetadata"
+        "304":
+          description: Not modified (If-None-Match matched, Q24).
+        "401":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "429":
+          $ref: "#/components/responses/Problem"
+    patch:
+      operationId: updateItemMetadata
+      summary: Update description and/or ttl_seconds (content immutable, Q8)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateItemJson"
+      responses:
+        "200":
+          description: Updated metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ItemMetadata"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "401":
+          $ref: "#/components/responses/Problem"
+        "403":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "429":
+          $ref: "#/components/responses/Problem"
+    delete:
+      operationId: deleteItem
+      summary: Delete an item (owner key only, admin bypasses; Q17/Q18)
+      responses:
+        "204":
+          description: Deleted.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+        "401":
+          $ref: "#/components/responses/Problem"
+        "403":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "429":
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/items/{name}/content:
+    parameters:
+      - $ref: "#/components/parameters/ItemName"
+    get:
+      operationId: getItemContent
+      summary: Read raw content bytes
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        "200":
+          description: Raw content, stored mime type, nosniff posture (Q21).
+          headers:
+            Content-Length:
+              schema: { type: integer }
+            ETag:
+              description: "SHA-256 ETag."
+              schema: { type: string }
+            X-Content-Type-Options:
+              schema: { type: string, enum: [nosniff] }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "304":
+          description: Not modified (If-None-Match matched, Q24).
+        "401":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "429":
+          $ref: "#/components/responses/Problem"
+
+  /healthz:
+    get:
+      operationId: liveness
+      summary: Liveness — 200 always as long as the process serves (Q51)
+      security: []
+      responses:
+        "200":
+          description: Process is up.
+
+  /readyz:
+    get:
+      operationId: readiness
+      summary: Readiness — storage writable + migrations current (Q51)
+      security: []
+      responses:
+        "200":
+          description: Ready.
+        "503":
+          description: Not ready.
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus text exposition (§9)
+      responses:
+        "200":
+          description: Prometheus text format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /manage/v1/stats:
+    get:
+      operationId: manageStats
+      summary: Item/key counts and byte totals (admin token, Q27)
+      responses:
+        "200":
+          description: Statistics.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401":
+          $ref: "#/components/responses/Problem"
+
+  /manage/v1/cleanup:
+    post:
+      operationId: manageCleanup
+      summary: Run one cleanup pass synchronously, return deleted count (Q39)
+      responses:
+        "200":
+          description: Cleanup pass result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { type: integer }
+        "401":
+          $ref: "#/components/responses/Problem"
+
+  /manage/v1/keys:
+    get:
+      operationId: listKeys
+      summary: List API keys (secret never returned)
+      responses:
+        "200":
+          description: Key list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        "401":
+          $ref: "#/components/responses/Problem"
+    post:
+      operationId: createKey
+      summary: Create an API key (secret returned once)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scopes:
+                  type: array
+                  items: { type: string, enum: [read, write] }
+      responses:
+        "201":
+          description: "Key created; secret present exactly once."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          $ref: "#/components/responses/Problem"
+        "401":
+          $ref: "#/components/responses/Problem"
+
+  /manage/v1/keys/{key_id}:
+    delete:
+      operationId: revokeKey
+      summary: Revoke an API key
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Revoked.
+        "401":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+
+  /manage/v1/items/{name}:
+    delete:
+      operationId: adminPurgeItem
+      summary: Admin purge — bypasses ownership (Q17)
+      parameters:
+        - $ref: "#/components/parameters/ItemName"
+      responses:
+        "204":
+          description: Purged.
+        "401":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+
+  /manage/v1/config:
+    get:
+      operationId: manageConfig
+      summary: Effective config with secrets redacted
+      responses:
+        "200":
+          description: Effective config, secrets redacted.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401":
+          $ref: "#/components/responses/Problem"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "mp_<keyid>_<secret> API key (Q25/Q26)."
+    adminToken:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Static admin token for /manage/v1 (Q27).
+  parameters:
+    ItemName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[a-z0-9]+$" }
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema: { type: string }
+  headers:
+    RequestId:
+      description: Correlation id, echoed or generated (Q50).
+      schema: { type: string }
+  responses:
+    Problem:
+      description: RFC 7807 problem (Q23).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+    CreateItemJson:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          description: Text content; must be valid UTF-8 (Q7).
+        mime_type:
+          type: string
+          description: RFC tree type/subtype; essence stored lowercase (Q6).
+        description:
+          type: string
+          maxLength: 1024
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 31536000
+          description: >
+            0 = never, only accepted when the server sets
+            allow_never_expire=true (Q34); otherwise within
+            [min_ttl_seconds, max_ttl_seconds].
+    CreateItemMultipart:
+      type: object
+      required: [file]
+      properties:
+        file:
+          type: string
+          format: binary
+          description: Raw bytes; Content-Length required (Q5), 411/413 otherwise.
+        mime_type:
+          type: string
+          default: application/octet-stream
+        description:
+          type: string
+          maxLength: 1024
+        ttl_seconds:
+          type: integer
+    UpdateItemJson:
+      type: object
+      minProperties: 1
+      properties:
+        description:
+          type: string
+          maxLength: 1024
+        ttl_seconds:
+          type: integer
+          description: Re-clamped to bounds on write (Q35).
+    ItemMetadata:
+      type: object
+      required:
+        [name, url, content_url, mime_type, size_bytes, created_at, ttl_seconds]
+      properties:
+        name: { type: string, example: k3v9qx2m4pta }
+        url: { type: string, example: /api/v1/items/k3v9qx2m4pta }
+        content_url: { type: string, example: /api/v1/items/k3v9qx2m4pta/content }
+        mime_type: { type: string, example: text/x-python }
+        description: { type: string, nullable: true }
+        size_bytes: { type: integer, example: 14 }
+        created_at: { type: string, format: date-time }
+        ttl_seconds:
+          type: integer
+          nullable: true
+          description: null when the item never expires.
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        checksum_sha256: { type: string }
+        content_kind:
+          type: string
+          enum: [text, binary]
+security:
+  - bearerAuth: []
