@@ -1,4 +1,13 @@
-{:paths ["src" "test"]
+{:paths ["src" "test" "resources"]
+ ;; bake resources/ (numbered migration DDL) into built binaries — project
+ ;; :paths alone are not packed, only dependency roots are (jolt 0.8.x).
+ :jolt/build {:embed ["resources"]}
  :deps {org.clojure/data.json {:mvn/version "2.5.2"}
         io.github.jolt-lang/time {:git/tag "v0.0.8"
-                                  :git/sha "33c5e9831c046cfcbe68bc0c9c33e92568eaebb1"}}}
+                                  :git/sha "33c5e9831c046cfcbe68bc0c9c33e92568eaebb1"}
+        io.github.jolt-lang/db {:git/url "https://github.com/jolt-lang/db.git"
+                                :git/sha "a54cc49f9ee8b6f6b0a1dd4f695a5390fedb5bfc"}
+        ;; provides java.security.MessageDigest (SHA-256) via OpenSSL — jolt core
+        ;; does not provide MessageDigest; needed for the checksum helper (M2).
+         io.github.jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto.git"
+                                          :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}}
