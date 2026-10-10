@@ -34,6 +34,17 @@
       (f c)
       (finally (.close c)))))
 
+(defn- plant-item!
+  "Inserts a row with an exact created_at (and optional mime/expires) so list
+   ordering, keyset cursors and filters are deterministic."
+  [dir {:keys [name mime created-at expires-at]}]
+  (with-db-conn dir
+    (fn [c]
+      (jdbc/execute! c
+        ["INSERT INTO items (name, description, mime_type, content_kind, size_bytes, checksum_sha256, storage_ref, ttl_seconds, created_at, expires_at, owner_key_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+         name nil (or mime "text/plain") "text" 0 (str (subs (str name) 0 8))
+         (str "blobs/aa/" (subs (str name) 0 8) "-" name) nil created-at expires-at nil]))))
+
 (deftest migrate-from-empty-then-remigrate-noop
   (let [dir (temp-dir)]
     (try
@@ -264,3 +275,52 @@
       (is (zero? (long (:api-keys st))))
       (is (string? (:oldest-created st)))
       (is (string? (:newest-created st))))))
+
+(deftest list-items-keyset-and-filters
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)
+            t1 "2026-01-01T00:00:00.000000001Z"
+            t2 "2026-01-02T00:00:00.000000001Z"
+            t3 "2026-01-03T00:00:00.000000001Z"
+            ;; same created_at for zz/aa proves the name tiebreak, and that the
+            ;; keyset comparison is (created_at, name), not (created_at, rowid)
+            zz "zzzzzzzzzzzz" aa "aaaaaaaaaaaa" bb "bbbbbbbbbbbb" cc "cccccccccccc"
+            dd "dddddddddddd"]
+        (plant-item! dir {:name zz :created-at t1 :mime "text/markdown"})
+        (plant-item! dir {:name aa :created-at t1 :mime "text/plain"})
+        (plant-item! dir {:name bb :created-at t2 :mime "application/json"})
+        (plant-item! dir {:name cc :created-at t3 :mime "application/octet-stream"})
+        (plant-item! dir {:name dd :created-at t3 :mime "text/plain"
+                          :expires-at "2026-01-03T00:00:00.000000002Z"})
+        (testing "ordering is created_at, name ascending"
+          (is (= [aa zz bb cc dd]
+                 (map :name (storage/list-items store {:include-expired? true})))))
+        (testing "limit caps the page"
+          (is (= [aa zz] (map :name (storage/list-items store {:limit 2 :include-expired? true})))))
+        (testing "cursor resumes strictly after (created_at, name)"
+          (is (= [bb cc dd]
+                 (map :name (storage/list-items store {:limit 10 :include-expired? true
+                                                       :cursor {:created-at t1 :name zz}}))))
+          (is (= [cc dd]
+                 (map :name (storage/list-items store {:limit 10 :include-expired? true
+                                                       :cursor {:created-at t2 :name bb}})))))
+        (testing "expired rows hidden unless asked"
+          (is (= [aa zz bb cc]
+                 (map :name (storage/list-items store {:include-expired? false})))))
+        (testing "mime_prefix is a literal lowercase prefix filter"
+          (is (= [aa zz dd]
+                 (map :name (storage/list-items store {:mime-prefix "text/" :include-expired? true}))))
+          (is (= [] (map :name (storage/list-items store {:mime-prefix "text/%"})))))
+        (testing "created range is a closed interval on the raw timestamp"
+          (is (= [bb cc dd]
+                 (map :name (storage/list-items store {:created-after t2 :include-expired? true}))))
+          (is (= [aa zz]
+                 (map :name (storage/list-items store {:created-before t1 :include-expired? true})))))
+        (testing "combined cursor + filters + limit"
+          (is (= [cc]
+                 (map :name (storage/list-items store {:limit 1 :include-expired? true
+                                                       :cursor {:created-at t2 :name bb}
+                                                       :mime-prefix "application/"})))))
+        (storage/close-storage store))
+      (finally (delete-recursively! dir)))))
