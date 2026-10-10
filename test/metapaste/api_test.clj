@@ -83,6 +83,8 @@
   (testing "declared length within cap passes"
     (is (nil? (api/content-length-gate {:headers {"content-length" "100"}} 100)))
     (is (nil? (api/content-length-gate {:headers {"content-length" "5"}} 100))))
+  (testing "repeated Content-Length (RFC 7230 comma-joined identical values)"
+    (is (nil? (api/content-length-gate {:headers {"content-length" "5, 5"}} 100))))
   (testing "declared length over cap -> 413"
     (let [[status slug _] (api/content-length-gate
                             {:headers {"content-length" "101"}} 100)]

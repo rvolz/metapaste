@@ -122,14 +122,23 @@
 
 (defn content-length-gate
   "nil when Content-Length is present and within cap; else [status slug
-   detail]. Absent (incl. chunked) -> 411 before any parsing (§3)."
+   detail]. Absent (incl. chunked) -> 411 before any parsing (§3). The adapter
+   validates Content-Length as identical digit strings, so the comma-joined
+   repeat form (RFC 7230) parses on its first segment."
   [request cap]
   (let [cl (get-in request [:headers "content-length"])]
     (cond
       (nil? cl) [411 "length-required" "Content-Length is required"]
-      (> (Long/parseLong cl) cap)
-      [413 "payload-too-large"
-       (str "request body exceeds the limit of " cap " bytes")])))
+      :else
+      (let [n (try
+                (Long/parseLong (str/trim (first (str/split cl #","))))
+                (catch Throwable _ ::invalid))]
+        (cond
+          (= ::invalid n)
+          [400 "validation-failed" "invalid Content-Length header"]
+          (> n cap)
+          [413 "payload-too-large"
+           (str "request body exceeds the limit of " cap " bytes")])))))
 
 (defn- read-capped
   "Consumes the body InputStream through ONE counted-cap read — never slurp,
@@ -347,7 +356,7 @@
       h
       (str (UUID/randomUUID)))))
 
-;; --- auth stub (TODO(M5)) ----------------------------------------------------
+;; --- auth stub ---------------------------------------------------------------
 
 ;; TODO(M5): replace this fixed dev key with real API-key auth — mp_<keyid>_
 ;; <secret> format, scopes, revoked_at, owner checks. See plan M5.
