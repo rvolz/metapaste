@@ -264,11 +264,14 @@
                    (into [(:created-at (:cursor opts)) (:created-at (:cursor opts))
                           (:name (:cursor opts))]))
           ;; keyset comparison stays on the raw stored strings: created_at has
-          ;; a fixed 9-digit fraction, so string order IS chronological order
+          ;; a fixed 9-digit fraction, so string order IS chronological order;
+          ;; LIMIT is a bound parameter, never concatenated
           sql (str "SELECT * FROM items"
                    (when (seq where) (str " WHERE " (str/join " AND " where)))
                    " ORDER BY created_at, name"
-                   (when-let [l (:limit opts)] (str " LIMIT " (long l))))]
+                   (when (:limit opts) " LIMIT ?"))
+          params (cond-> params
+                   (:limit opts) (conj (long (:limit opts))))]
       (jdbc/fetch conn (into [sql] params))))
 
   (stats [_]
