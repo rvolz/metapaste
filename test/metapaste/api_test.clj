@@ -8,6 +8,7 @@
             [clojure.test :refer [deftest is testing]]
             [jdbc.core :as jdbc]
             [metapaste.api :as api]
+            [metapaste.auth :as auth]
             [metapaste.storage :as storage])
   (:import [java.io ByteArrayInputStream File]
            [java.nio.file Files]
@@ -203,17 +204,26 @@
           :default_ttl_seconds 259200
           :allow_never_expire false
           :path_prefix ""
-          :dev_api_key "testkey"
+          :rate_limit_rps 10
+          :rate_limit_burst 20
           :max_item_bytes 65536}
          overrides))
 
-(defn- make-test-handler [store cfg]
-  (api/make-handler
-    {:store store
-     :config (handler-cfg cfg)
-     :multipart-parser (fn [_] {:error {:status 400
-                                        :slug "validation-failed"
-                                        :detail "multipart not used here"}})}))
+(defn- make-test-handler
+  "Ring handler for a test store. M5 retired the :dev_api_key bypass, so a
+   real key is minted on the store per handler and its mp_... secret is kept
+   in handler metadata (see send-json)."
+  [store cfg]
+  (let [secret (:secret (auth/create-key! store {:label "api-test"
+                                                 :scopes "read,write"}))]
+    (with-meta
+      (api/make-handler
+        {:store store
+         :config (handler-cfg cfg)
+         :multipart-parser (fn [_] {:error {:status 400
+                                            :slug "validation-failed"
+                                            :detail "multipart not used here"}})})
+      {::token secret})))
 
 (defn- send-json
   "Ring call through make-handler; returns [status parsed-json-body]."
@@ -223,7 +233,7 @@
         resp (handler {:request-method method
                        :uri uri
                        :headers {"content-type" "application/json"
-                                 "authorization" "Bearer testkey"
+                                 "authorization" (str "Bearer " (::token (meta handler)))
                                  "content-length" (str (alength raw))}
                        :body (ByteArrayInputStream. raw)})]
     [(:status resp) (json/read-str (:body resp) :key-fn keyword)]))
