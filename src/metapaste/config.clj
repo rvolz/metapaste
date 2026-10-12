@@ -16,7 +16,8 @@
    :admin_token nil
    :port 8080
    :path_prefix ""
-   :dev_api_key "mp_dev_devkey"})
+   :dev_api_key "mp_dev_devkey"
+   :cleanup_interval_s 3600})
 
 (def ^:private schema
   {:default_ttl_seconds :int
@@ -30,7 +31,8 @@
    :admin_token :string
    :port :int
    :path_prefix :string
-   :dev_api_key :string})
+   :dev_api_key :string
+   :cleanup_interval_s :int})
 
 (def ^:private env-prefix "METAPASTE_")
 
@@ -141,6 +143,8 @@
                  ", max_ttl_seconds " mx "]")))
     (when (< (:rate_limit_rps cfg) 1)
       (fail (str "rate_limit_rps must be at least 1, got " (:rate_limit_rps cfg))))
+    (when (< (:cleanup_interval_s cfg) 1)
+      (fail (str "cleanup_interval_s must be at least 1, got " (:cleanup_interval_s cfg))))
     (when (< (:rate_limit_burst cfg) 1)
       (fail (str "rate_limit_burst must be at least 1, got " (:rate_limit_burst cfg))))
     (when (or (< (:port cfg) 0) (> (:port cfg) 65535))
