@@ -1,14 +1,18 @@
 (ns metapaste.api-test
   "Unit tests for the pure request/response logic in metapaste.api: mime/desc/
    ttl validation, list query parsing, ETag matching, serving posture, and the
-   problem+json shape. End-to-end behavior lives in http-integration-test."
-  (:require [clojure.test :refer [deftest is testing]]
+   problem+json shape. End-to-end behavior lives in http-integration-test; the
+   M4 expiry-semantics regressions drive make-handler directly so they can set
+   allow_never_expire per case."
+  (:require [clojure.data.json :as json]
+            [clojure.test :refer [deftest is testing]]
             [jdbc.core :as jdbc]
             [metapaste.api :as api]
             [metapaste.storage :as storage])
-  (:import [java.io File]
+  (:import [java.io ByteArrayInputStream File]
            [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+           [java.nio.file.attribute FileAttribute]
+           [java.time Instant]))
 
 (defn- temp-dir []
   (.toFile (Files/createTempDirectory "mp3-api-" (make-array FileAttribute 0))))
@@ -190,3 +194,150 @@
     (is (re-find #"\"title\":" body))
     (is (re-find #"\"status\":404" body))
     (is (re-find #"\"detail\":\"no such item\"" body))))
+
+;; --- M4: expiry semantics regression (Q35-Q38) -------------------------------
+
+(defn- handler-cfg [overrides]
+  (merge {:min_ttl_seconds 60
+          :max_ttl_seconds 31536000
+          :default_ttl_seconds 259200
+          :allow_never_expire false
+          :path_prefix ""
+          :dev_api_key "testkey"
+          :max_item_bytes 65536}
+         overrides))
+
+(defn- make-test-handler [store cfg]
+  (api/make-handler
+    {:store store
+     :config (handler-cfg cfg)
+     :multipart-parser (fn [_] {:error {:status 400
+                                        :slug "validation-failed"
+                                        :detail "multipart not used here"}})}))
+
+(defn- send-json
+  "Ring call through make-handler; returns [status parsed-json-body]."
+  [handler method uri body]
+  (let [raw (.getBytes (json/write-str body :escape-slash false :escape-unicode false)
+                       "UTF-8")
+        resp (handler {:request-method method
+                       :uri uri
+                       :headers {"content-type" "application/json"
+                                 "authorization" "Bearer testkey"
+                                 "content-length" (str (alength raw))}
+                       :body (ByteArrayInputStream. raw)})]
+    [(:status resp) (json/read-str (:body resp) :key-fn keyword)]))
+
+(deftest create-expires-at-is-created-at-plus-ttl
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [handler (make-test-handler store {})
+                t0 (Instant/now)
+                [st m] (send-json handler :post "/api/v1/items"
+                                  {:content "t" :mime_type "text/plain"
+                                   :ttl_seconds 3600})
+                created (Instant/parse (:created_at m))
+                expires (Instant/parse (:expires_at m))]
+            (is (= 201 st))
+            (testing "expires_at = created_at + ttl within the 2 s tolerance"
+              (is (<= 3598 (- (.getEpochSecond expires)
+                              (.getEpochSecond created))
+                      3602))
+              (let [[st2 m2] (send-json handler :post "/api/v1/items"
+                                        {:content "u" :mime_type "text/plain"
+                                         :ttl_seconds 120})]
+                (is (= 201 st2))
+                (is (<= 118 (- (.getEpochSecond (Instant/parse (:expires_at m2)))
+                               (.getEpochSecond (Instant/parse (:created_at m2))))
+                        122))))
+            (testing "and within 2 s of the server clock at create time"
+              (is (<= -2 (- (.getEpochSecond expires)
+                            (+ (.getEpochSecond t0) 3600))
+                      2))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest patch-recomputes-expires-from-now-not-from-creation
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [handler (make-test-handler store {})
+                [st m] (send-json handler :post "/api/v1/items"
+                                  {:content "t" :mime_type "text/plain"
+                                   :ttl_seconds 3600})
+                nm (:name m)]
+            (is (= 201 st))
+            ;; T+10min: backdate created_at so the two candidate formulas
+            ;; differ by 600 s — created_at+ttl would land 600 s early
+            (with-db-conn dir
+              (fn [c]
+                (jdbc/execute! c
+                  ["UPDATE items SET created_at = ? WHERE name = ?"
+                   (storage/iso-utc (.minusSeconds (Instant/now) 600)) nm])))
+            (let [t-patch (Instant/now)
+                  [pst pm] (send-json handler :patch (str "/api/v1/items/" nm)
+                                      {:ttl_seconds 3600})
+                  expires (Instant/parse (:expires_at pm))
+                  created (Instant/parse (:created_at pm))]
+              (is (= 200 pst) (pr-str pm))
+              (testing "extension recomputes expires_at from now (Q35)"
+                (is (<= -5 (- (.getEpochSecond expires)
+                              (+ (.getEpochSecond t-patch) 3600))
+                        5)))
+              (testing "and not from creation"
+                (is (>= (Math/abs (long (- (.getEpochSecond expires)
+                                           (+ (.getEpochSecond created) 3600))))
+                        500))))
+            (testing "shortening is allowed"
+              (let [[sst sm] (send-json handler :patch (str "/api/v1/items/" nm)
+                                        {:ttl_seconds 60})]
+                (is (= 200 sst))
+                (is (= 60 (:ttl_seconds sm)))))
+            (testing "out-of-bounds TTL is 400, never re-clamped (Q32/Q33)"
+              (is (= 400 (first (send-json handler :patch (str "/api/v1/items/" nm)
+                                           {:ttl_seconds 59}))))
+              (is (= 400 (first (send-json handler :patch (str "/api/v1/items/" nm)
+                                           {:ttl_seconds 31536001}))))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest ttl-zero-only-with-allow-never-expire
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (testing "allow_never_expire=false: ttl 0 is 400 on create and on PATCH"
+            (let [handler (make-test-handler store {})]
+              (is (= 400 (first (send-json handler :post "/api/v1/items"
+                                           {:content "x" :mime_type "text/plain"
+                                            :ttl_seconds 0}))))
+              (let [[st m] (send-json handler :post "/api/v1/items"
+                                      {:content "x" :mime_type "text/plain"
+                                       :ttl_seconds 3600})]
+                (is (= 201 st))
+                (is (= 400 (first (send-json handler :patch
+                                             (str "/api/v1/items/" (:name m))
+                                             {:ttl_seconds 0})))))))
+          (testing "allow_never_expire=true: ttl 0 accepted, expires_at NULL"
+            (let [handler (make-test-handler store {:allow_never_expire true})
+                  [st m] (send-json handler :post "/api/v1/items"
+                                    {:content "forever" :mime_type "text/plain"
+                                     :ttl_seconds 0})]
+              (is (= 201 st) (pr-str m))
+              (is (nil? (:expires_at m)))
+              ;; Spec Q37 also asks for stored ttl_seconds = 0 shown as "never".
+              ;; Spec 3.2 (ttl_seconds INTEGER NULL) and the FROZEN
+              ;; docs/openapi.yaml ItemMetadata.ttl_seconds ("null when the item
+              ;; never expires") both say null, so null is what ships; the
+              ;; conflict is reported in the M4 summary, not silently resolved
+              ;; by editing a frozen contract.
+              (is (nil? (:ttl_seconds m)))
+              (let [[pst pm] (send-json handler :patch (str "/api/v1/items/" (:name m))
+                                        {:ttl_seconds 0})]
+                (is (= 200 pst) (pr-str pm))
+                (is (nil? (:expires_at pm))))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
