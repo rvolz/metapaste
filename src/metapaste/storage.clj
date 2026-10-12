@@ -12,7 +12,7 @@
 
 ;; --- timestamps --------------------------------------------------------------
 
-(defn- iso-utc
+(defn iso-utc
   "ISO-8601 UTC with a fixed 9-digit fraction, so lexicographic ordering of
    stored strings matches chronological ordering."
   [^Instant t]
@@ -36,7 +36,10 @@
 
 ;; --- mime type -> content kind (Q7) ------------------------------------------
 
-(defn- content-kind [mime]
+(defn content-kind
+  "Q7: text/* plus application/{json,xml,javascript} and +json/+xml suffixes
+   are text; everything else is binary."
+  [mime]
   (let [m (or mime "")]
     (if (or (str/starts-with? m "text/")
             (#{"application/json" "application/xml" "application/javascript"} m)
@@ -155,7 +158,9 @@
   (delete-item! [store name]
     "Delete a live row and its blob; true only when a live row was removed.")
   (list-items [store opts]
-    "Item rows, expired hidden unless {:include-expired? true}.")
+    "Item rows ordered by (created_at, name), expired hidden unless
+     {:include-expired? true}; opts may also carry :limit, :cursor
+     {:created-at :name}, :mime-prefix, :created-after, :created-before.")
   (stats [store]
     "Counts/sums for the metrics surface.")
   (delete-expired-batch [store limit]
@@ -239,11 +244,35 @@
       (boolean ref)))
 
   (list-items [_ opts]
-    (if (:include-expired? opts)
-      (jdbc/fetch conn ["SELECT * FROM items ORDER BY created_at, rowid"])
-      (jdbc/fetch conn
-        ["SELECT * FROM items WHERE expires_at IS NULL OR expires_at > ? ORDER BY created_at, rowid"
-         (iso-utc (Instant/now))])))
+    (let [now (iso-utc (Instant/now))
+          where (cond-> []
+                  (not (:include-expired? opts))
+                  (conj "(expires_at IS NULL OR expires_at > ?)")
+                  (:mime-prefix opts) (conj "mime_type LIKE ? ESCAPE '\\'")
+                  (:created-after opts) (conj "created_at >= ?")
+                  (:created-before opts) (conj "created_at <= ?")
+                  (:cursor opts) (conj "(created_at > ? OR (created_at = ? AND name > ?))"))
+          params (cond-> []
+                   (not (:include-expired? opts)) (conj now)
+                   (:mime-prefix opts)
+                   (conj (str (-> (:mime-prefix opts)
+                                  (str/replace #"[%_\\]" #(str "\\" (first %))))
+                              "%"))
+                   (:created-after opts) (conj (:created-after opts))
+                   (:created-before opts) (conj (:created-before opts))
+                   (:cursor opts)
+                   (into [(:created-at (:cursor opts)) (:created-at (:cursor opts))
+                          (:name (:cursor opts))]))
+          ;; keyset comparison stays on the raw stored strings: created_at has
+          ;; a fixed 9-digit fraction, so string order IS chronological order;
+          ;; LIMIT is a bound parameter, never concatenated
+          sql (str "SELECT * FROM items"
+                   (when (seq where) (str " WHERE " (str/join " AND " where)))
+                   " ORDER BY created_at, name"
+                   (when (:limit opts) " LIMIT ?"))
+          params (cond-> params
+                   (:limit opts) (conj (long (:limit opts))))]
+      (jdbc/fetch conn (into [sql] params))))
 
   (stats [_]
     (let [now (iso-utc (Instant/now))

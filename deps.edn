@@ -7,7 +7,23 @@
                                   :git/sha "33c5e9831c046cfcbe68bc0c9c33e92568eaebb1"}
         io.github.jolt-lang/db {:git/url "https://github.com/jolt-lang/db.git"
                                 :git/sha "a54cc49f9ee8b6f6b0a1dd4f695a5390fedb5bfc"}
-        ;; provides java.security.MessageDigest (SHA-256) via OpenSSL — jolt core
-        ;; does not provide MessageDigest; needed for the checksum helper (M2).
-         io.github.jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto.git"
-                                          :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}}
+         ;; provides java.security.MessageDigest (SHA-256) via OpenSSL — jolt core
+         ;; does not provide MessageDigest; needed for the checksum helper (M2).
+          io.github.jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto.git"
+                                           :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}
+         ;; M3 HTTP stack. The adapter transitively pulls jolt-lang/jolt-crypto
+         ;; from a different repo — excluded so only the pin above resolves
+         ;; jolt.crypto (ring-chez.websocket requires it on load).
+         jolt-lang/ring-chez-adapter {:git/url "https://github.com/jolt-lang/ring-chez-adapter"
+                                      :git/tag "v0.7.12"
+                                      :git/sha "abafb1186f533af9df3bf30d30c0bc56a234c8fc"
+                                      :exclusions [jolt-lang/jolt-crypto]}
+         metosin/reitit-core {:mvn/version "0.10.1"}
+         ;; reitit-core's Trie host class (reitit-core itself is unmodified on jolt)
+         jolt-lang/router {:git/url "https://github.com/jolt-lang/router"
+                           :git/sha "1056e782a80ee8cf54276f639f97811b619bbc47"
+                           :exclusions [weavejester/meta-merge]}}
+ :aliases {:test {:extra-deps {;; test-only: real HTTP client for the integration suite
+                               jolt-lang/http-client {:git/url "https://github.com/jolt-lang/http-client"
+                                                      :git/tag "v0.1.2"
+                                                      :git/sha "00455b8135861b2fd2ddbe3e7887a94e7aba5760"}}}}}

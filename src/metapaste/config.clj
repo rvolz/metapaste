@@ -13,7 +13,10 @@
    :rate_limit_rps 10
    :rate_limit_burst 20
    :data_dir "./data"
-   :admin_token nil})
+   :admin_token nil
+   :port 8080
+   :path_prefix ""
+   :dev_api_key "mp_dev_devkey"})
 
 (def ^:private schema
   {:default_ttl_seconds :int
@@ -24,7 +27,10 @@
    :rate_limit_rps :int
    :rate_limit_burst :int
    :data_dir :string
-   :admin_token :string})
+   :admin_token :string
+   :port :int
+   :path_prefix :string
+   :dev_api_key :string})
 
 (def ^:private env-prefix "METAPASTE_")
 
@@ -36,7 +42,7 @@
   ;; env vars consumed outside the config schema (Q54)
   #{"METAPASTE_CONFIG_FILE"})
 
-(def ^:private secret-key-re #"(?i)token|secret|password")
+(def ^:private secret-key-re #"(?i)token|secret|password|api_key")
 
 (defn- fail [msg]
   (throw (ex-info (str "config: " msg) {})))
@@ -137,6 +143,13 @@
       (fail (str "rate_limit_rps must be at least 1, got " (:rate_limit_rps cfg))))
     (when (< (:rate_limit_burst cfg) 1)
       (fail (str "rate_limit_burst must be at least 1, got " (:rate_limit_burst cfg))))
+    (when (or (< (:port cfg) 0) (> (:port cfg) 65535))
+      (fail (str "port " (:port cfg) " is outside 0-65535")))
+    (let [p (:path_prefix cfg)]
+      (when-not (or (= "" p)
+                    (and (str/starts-with? p "/") (not (str/ends-with? p "/"))))
+        (fail (str "path_prefix " (pr-str p)
+                   " must be empty or start with \"/\" and not end with \"/\""))))
     cfg))
 
 (defn- resolve-config-file

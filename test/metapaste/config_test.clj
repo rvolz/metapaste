@@ -23,7 +23,10 @@
     (is (= 10 (:rate_limit_rps cfg)))
     (is (= 20 (:rate_limit_burst cfg)))
     (is (= "./data" (:data_dir cfg)))
-    (is (nil? (:admin_token cfg)))))
+    (is (nil? (:admin_token cfg)))
+    (is (= 8080 (:port cfg)))
+    (is (= "" (:path_prefix cfg)))
+    (is (= "mp_dev_devkey" (:dev_api_key cfg)))))
 
 (deftest precedence-env-over-file-over-default
   (with-config-file
@@ -62,6 +65,18 @@
   (testing "boolean given a non-boolean"
     (is (thrown-with-msg? Exception #"boolean"
           (config/load-config {:env {"METAPASTE_ALLOW_NEVER_EXPIRE" "maybe"}}))))
+  (testing "port outside 0-65535"
+    (is (thrown-with-msg? Exception #"port"
+          (config/load-config {:env {"METAPASTE_PORT" "70000"}})))
+    (is (thrown-with-msg? Exception #"port"
+          (config/load-config {:env {"METAPASTE_PORT" "-1"}}))))
+  (testing "path_prefix shapes"
+    (is (thrown-with-msg? Exception #"path_prefix"
+          (config/load-config {:env {"METAPASTE_PATH_PREFIX" "no-slash"}})))
+    (is (thrown-with-msg? Exception #"path_prefix"
+          (config/load-config {:env {"METAPASTE_PATH_PREFIX" "/trailing/"}})))
+    (is (= "/mp" (:path_prefix (config/load-config {:env {"METAPASTE_PATH_PREFIX" "/mp"}}))))
+    (is (= "" (:path_prefix (config/load-config {:env {"METAPASTE_PATH_PREFIX" ""}})))))
   (testing "config file that is not EDN"
     (with-config-file "bad.edn" "{oops"
       (fn [path]
@@ -106,4 +121,8 @@
               "db_password" "***REDACTED***"
               "x_token" "***REDACTED***"
               "plain" "keep"}
-             (into {} (map (fn [[k v]] [(name k) v]) red)))))))
+             (into {} (map (fn [[k v]] [(name k) v]) red))))))
+  (testing "dev_api_key is redacted like admin_token"
+    (let [red (config/redact-config {:dev_api_key "mp_dev_leak" :port 8080})]
+      (is (= "***REDACTED***" (:dev_api_key red)))
+      (is (= 8080 (:port red))))))
