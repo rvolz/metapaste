@@ -255,6 +255,24 @@
           (is (true? (cleanup/stop!)))
           (is (not (.isAlive ^Thread (:thread w3)))))))))
 
+(deftest start-replaces-a-worker-whose-thread-already-finished
+  (with-store [store dir]
+    (let [dead (Thread. ^Runnable (fn [] nil) "already-finished")]
+      (.start dead)
+      (.join dead 5000)
+      ;; simulate stop!'s bounded join timing out and the thread finishing
+      ;; afterwards: the stale entry must not be handed back by start!
+      (reset! @(ns-resolve 'metapaste.cleanup 'worker)
+              {:thread dead :running? (atom false)})
+      (try
+        (let [w (cleanup/start! store {:interval-s 1 :grace-s 0})]
+          (is (not (identical? dead (:thread w))))
+          (is (.isAlive ^Thread (:thread w)) "start! returned a dead worker")
+          (is (true? (cleanup/stop!)))
+          (is (not (.isAlive ^Thread (:thread w)))))
+        (finally
+          (cleanup/stop!))))))
+
 ;; --- delta 7: no-race parallel write + cleanup stress ------------------------
 
 (deftest parallel-writes-and-cleanup-do-not-race

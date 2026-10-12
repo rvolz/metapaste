@@ -139,6 +139,10 @@
   ([store] (start! store {}))
   ([store opts]
    (locking worker
+     ;; stop! may have timed out its bounded join: prune the entry once that
+     ;; thread has finished, so start! brings up a worker that actually runs
+     (when (and @worker (not (.isAlive ^Thread (:thread @worker))))
+       (reset! worker nil))
      (or @worker
          (let [running? (atom true)
                rng (or (:rng opts) (fn [] (Math/random)))
