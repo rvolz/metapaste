@@ -7,8 +7,10 @@
   parser as a function in its context map."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
+            [metapaste.auth :as auth]
             [metapaste.log :as log]
             [metapaste.names :as names]
+            [metapaste.ratelimit :as ratelimit]
             [metapaste.storage :as storage])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream InputStream]
            [java.nio ByteBuffer]
@@ -44,11 +46,13 @@
 (def ^:private titles
   {400 "Bad Request"
    401 "Unauthorized"
+   403 "Forbidden"
    404 "Not Found"
    405 "Method Not Allowed"
    411 "Length Required"
    413 "Payload Too Large"
    415 "Unsupported Media Type"
+   429 "Too Many Requests"
    500 "Internal Server Error"})
 
 (defn problem
@@ -356,14 +360,48 @@
       h
       (str (UUID/randomUUID)))))
 
-;; --- auth stub ---------------------------------------------------------------
+;; --- auth (M5): 401 -> 403 -> 429 before the handler --------------------------
 
-;; TODO(M5): replace this fixed dev key with real API-key auth — mp_<keyid>_
-;; <secret> format, scopes, revoked_at, owner checks. See plan M5.
-(defn- authed? [cfg request]
-  (when (= (str "Bearer " (:dev_api_key cfg))
-           (get-in request [:headers "authorization"]))
-    {:key-id "dev"}))
+(defn- authorize
+  "M5 auth chain on a matched route: bearer auth (401), scope check (403,
+   write implies read), per-key rate limit (429 + Retry-After: 1).
+   Returns {:request req'} with :key-id/:scopes attached when allowed, else
+   {:response problem :key-id k-or-nil} (key-id feeds request logging)."
+  [ctx request method]
+  (let [cfg (:config ctx)
+        result (auth/check-bearer (:store ctx)
+                                  (get-in request [:headers "authorization"]))]
+    (cond
+      (:error result)
+      {:response (problem 401 "unauthorized" (:error result)) :key-id nil}
+
+      (not (auth/scope-allows? (:scopes result) method))
+      {:response (problem 403 "forbidden" "insufficient scope for this request")
+       :key-id (:key-id result)}
+
+      (not (ratelimit/allow? (:limiter ctx) (:key-id result)
+                             {:rps (:rate_limit_rps cfg)
+                              :burst (:rate_limit_burst cfg)}))
+      {:response (problem 429 "rate-limit-exceeded" "rate limit exceeded"
+                           {"Retry-After" "1"})
+       :key-id (:key-id result)}
+
+      :else
+      {:request (-> request
+                    (assoc :key-id (:key-id result))
+                    (assoc :scopes (:scopes result)))
+       :key-id (:key-id result)})))
+
+(defn- ownership-gate
+  "Q17/Q18: PATCH/DELETE are owner-only — non-owner gets 403 (admin?
+   bypasses, wired by M6). Unknown/expired rows fall through so the handler
+   answers 404."
+  [ctx request]
+  (when (#{:patch :delete} (:request-method request))
+    (when-let [row (storage/get-item (:store ctx)
+                                     (get-in request [:path-params :name]))]
+      (when-not (auth/may-modify? request row)
+        (problem 403 "forbidden" "item is not owned by this key")))))
 
 ;; --- handlers ----------------------------------------------------------------
 
@@ -512,7 +550,6 @@
       (problem 404 "not-found" "item not found or expired"))))
 
 (defn patch-item [ctx request]
-  ;; TODO(M5): enforce owner-only PATCH (owner_key_id match) + admin bypass.
   (let [cfg (:config ctx)
         store (:store ctx)
         nm (get-in request [:path-params :name])]
@@ -557,7 +594,6 @@
                                      "item not found or expired")))))))))))))))
 
 (defn delete-item [ctx request]
-  ;; TODO(M5): enforce owner-only DELETE (owner_key_id match) + admin bypass.
   (let [nm (get-in request [:path-params :name])]
     (if (storage/delete-item! (:store ctx) nm)
       {:status 204 :headers {}}
@@ -594,21 +630,31 @@
   (str/join ", " (map (comp str/upper-case name)
                       (filter http-methods (keys data)))))
 
-(defn- dispatch [ctx request]
+(defn- dispatch
+  "Route match -> 404 -> method 405 -> authorize (401/403/429) -> ownership
+   gate for PATCH/DELETE (403) -> handler. Returns [response key-id]; key-id
+   is the authenticated key (nil when the request never got that far), for
+   the request log line."
+  [ctx request]
   (let [router (:router ctx)]
     (if-let [match (reitit/match-by-path router (:uri request))]
       (let [data (:data match)
             method (:request-method request)]
         (if-let [handler (get data method)]
-          (if-let [auth (authed? (:config ctx) request)]
-            (handler ctx (-> request
-                             (assoc :path-params (:path-params match))
-                             (assoc :key-id (:key-id auth))))
-            (problem 401 "unauthorized" "missing or invalid bearer key"))
-          (problem 405 "method-not-allowed"
-                   (str (str/upper-case (name method)) " not allowed on this path")
-                   {"Allow" (allow-header data)})))
-      (problem 404 "not-found" (str "no route for " (:uri request))))))
+          (let [authz (authorize ctx request method)]
+            (if-let [resp (:response authz)]
+              [resp (:key-id authz)]
+              (let [req (assoc (:request authz)
+                               :path-params (:path-params match))
+                    forbidden (ownership-gate ctx req)]
+                (if forbidden
+                  [forbidden (:key-id authz)]
+                  [(handler ctx req) (:key-id authz)]))))
+          [(problem 405 "method-not-allowed"
+                    (str (str/upper-case (name method)) " not allowed on this path")
+                    {"Allow" (allow-header data)})
+           nil]))
+      [(problem 404 "not-found" (str "no route for " (:uri request))) nil])))
 
 (defn make-handler
   "Ring-style handler over plain request maps. ctx:
@@ -616,16 +662,19 @@
    replaceable multipart seam (metapaste.http supplies the ring-chez based
    implementation); it returns {:params :files} or {:error {:status :slug :detail}}."
   [{:keys [store config] :as ctx}]
-  (let [ctx (assoc ctx :router (reitit/router (route-table config)))]
+  (let [ctx (assoc ctx
+                   :router (reitit/router (route-table config))
+                   ;; per-server token buckets (Q31), one atom per handler
+                   :limiter (atom {}))]
     (fn [request]
       (let [rid (request-id request)
             t0 (System/currentTimeMillis)]
         (log/with-request-id rid
-          (let [resp (dispatch ctx request)
+          (let [[resp key-id] (dispatch ctx request)
                 resp (assoc-in resp [:headers "X-Request-Id"] rid)]
             (log/info "request" {:method (:request-method request)
                                  :route (:uri request)
                                  :status (:status resp)
                                  :latency_ms (- (System/currentTimeMillis) t0)
-                                 :key_id (:key-id (authed? (:config ctx) request))})
+                                 :key_id key-id})
             resp))))))
