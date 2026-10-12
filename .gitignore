@@ -1,0 +1,6 @@
+# build output
+/metapaste
+metapaste.build/
+
+# agent session state
+.dirge/
