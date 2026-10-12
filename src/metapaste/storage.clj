@@ -165,6 +165,13 @@
     "Counts/sums for the metrics surface.")
   (delete-expired-batch [store limit]
     "Delete up to limit expired rows, oldest first; returns deleted names.")
+  (create-api-key! [store row]
+    "Insert an api_keys row (key_id, key_hash, label, scopes, created_at);
+     returns the stored row.")
+  (get-api-key [store key-id]
+    "api_keys row for a key_id (revoked rows included), nil when unknown.")
+  (revoke-api-key! [store key-id revoked-at]
+    "Stamp revoked_at when currently NULL; true only when a row changed.")
   (put-blob! [store name content]
     "Write bytes to a fresh content-addressed blob; returns its storage_ref.")
   (get-blob [store ref]
@@ -310,6 +317,24 @@
                                            [(:name r) (:storage_ref r)])))))))]
       (doseq [[_ ref] deleted] (delete-blob-file! dir ref))
       (mapv first deleted)))
+
+  (create-api-key! [_ row]
+    (with-write-tx conn
+      (fn []
+        (jdbc/execute! conn
+          ["INSERT INTO api_keys (key_id, key_hash, label, scopes, created_at) VALUES (?,?,?,?,?)"
+           (:key_id row) (:key_hash row) (:label row) (:scopes row) (:created_at row)])
+        (jdbc/fetch-one conn ["SELECT * FROM api_keys WHERE key_id = ?" (:key_id row)]))))
+
+  (get-api-key [_ key-id]
+    (jdbc/fetch-one conn ["SELECT * FROM api_keys WHERE key_id = ?" key-id]))
+
+  (revoke-api-key! [_ key-id revoked-at]
+    (with-write-tx conn
+      (fn []
+        (pos? (long (jdbc/execute! conn
+                       ["UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL"
+                        revoked-at key-id]))))))
 
   (put-blob! [_ nm content]
     (when-not (valid-blob-name? nm)
