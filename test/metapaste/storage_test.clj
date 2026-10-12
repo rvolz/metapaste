@@ -276,6 +276,108 @@
       (is (string? (:oldest-created st)))
       (is (string? (:newest-created st))))))
 
+;; --- M4: in-flight blob ref registry + orphan-sweep interface members -------
+
+(defn- spy-blob-write!
+  "Rebinds the private blob writer so f sees the registry state at the exact
+   moment each blob file is written. Returns f's value; @refs collects
+   [ref registered-at-write?]."
+  [refs f]
+  (let [v (ns-resolve 'metapaste.storage 'write-blob-file!)
+        orig @v] ;; capture the fn VALUE: invoking the var after rebinding
+                 ;; would re-enter the spy and recurse until OOM
+    (with-redefs-fn
+      {v (fn [d ref content]
+           (swap! refs conj [ref (storage/in-flight-blob-ref? ref)])
+           (orig d ref content))}
+      f)))
+
+(deftest in-flight-registry-brackets-create
+  (with-store [store dir]
+    (let [refs (atom [])]
+      (spy-blob-write!
+        refs
+        (fn []
+          (let [it (storage/create-item! store {:content (.getBytes "fresh" "UTF-8")
+                                                :mime_type "text/plain"})]
+            (testing "registered before the blob file was written"
+              (is (= [[(:storage_ref it) true]] @refs)))
+            (testing "unregistered once the transaction resolved"
+              (is (false? (storage/in-flight-blob-ref? (:storage_ref it)))))))))))
+
+(deftest in-flight-registry-clears-on-name-taken-retry
+  (with-store [store dir]
+    (let [refs (atom [])
+          script (atom ["k3v9qx2m4pta" "k3v9qx2m4pta" "b7hjm2npq3vw"])]
+      (with-redefs [names/random-name
+                    (fn []
+                      (let [n (first @script)]
+                        (swap! script subvec 1)
+                        n))]
+        (spy-blob-write!
+          refs
+          (fn []
+            (let [a (storage/create-item! store {:content (.getBytes "a" "UTF-8")
+                                                 :mime_type "text/plain"})
+                  b (storage/create-item! store {:content (.getBytes "b" "UTF-8")
+                                                 :mime_type "text/plain"})]
+              ;; three blob writes: a, b's taken attempt, b's retry
+              (is (= [true true true] (map second @refs)))
+              (is (every? (complement storage/in-flight-blob-ref?)
+                          (map first @refs)))
+              (is (false? (storage/in-flight-blob-ref? (:storage_ref a))))
+              (is (false? (storage/in-flight-blob-ref? (:storage_ref b)))))))))))
+
+(deftest in-flight-registry-clears-when-create-fails
+  (with-store [store dir]
+    (let [refs (atom [])]
+      (with-redefs [names/random-name (fn [] "k3v9qx2m4pta")]
+        ;; hold the only name the stubbed RNG can produce, so every later
+        ;; attempt collides and unique-name gives up with :exhausted
+        (storage/create-item! store {:content (.getBytes "seed" "UTF-8")
+                                     :mime_type "text/plain"})
+        (spy-blob-write!
+          refs
+          (fn []
+            (is (thrown? Exception
+                         (storage/create-item! store {:content (.getBytes "x" "UTF-8")
+                                                      :mime_type "text/plain"})))
+            (is (seq @refs))
+            (testing "every attempted ref unregistered after the failure"
+              (is (every? (complement storage/in-flight-blob-ref?)
+                          (map first @refs))))))))))
+
+(deftest blob-referenced-covers-expired-rows
+  (with-store [store dir]
+    (let [live (storage/create-item! store {:content (.getBytes "live" "UTF-8")
+                                            :mime_type "text/plain"
+                                            :ttl_seconds 3600})
+          exp (storage/create-item! store {:content (.getBytes "gone" "UTF-8")
+                                           :mime_type "text/plain"
+                                           :ttl_seconds -5})]
+      (is (true? (storage/blob-referenced? store (:storage_ref live))))
+      (testing "expired-but-uncollected rows still count as referenced"
+        (is (true? (storage/blob-referenced? store (:storage_ref exp)))))
+      (is (false? (storage/blob-referenced? store
+                                             (str "blobs/aa/"
+                                                  (subs (storage/sha256-hex (.getBytes "x" "UTF-8")) 0 8)
+                                                  "-nope1234567"))))
+      (storage/delete-item! store (:name live))
+      (is (false? (storage/blob-referenced? store (:storage_ref live)))))))
+
+(deftest list-blob-files-reports-ref-and-mtime
+  (with-store [store dir]
+    (let [it (storage/create-item! store {:content (.getBytes "listed" "UTF-8")
+                                          :mime_type "text/plain"})
+          orphan-ref "blobs/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-orphanorphan"
+          orphan-file (java.io.File. dir orphan-ref)]
+      (.mkdirs (.getParentFile orphan-file))
+      (spit orphan-file "orphan")
+      (let [files (storage/list-blob-files store)
+            by-ref (into {} (map (juxt :ref identity)) files)]
+        (is (= #{(:storage_ref it) orphan-ref} (set (keys by-ref))))
+        (is (every? #(integer? (long (:mtime-ms %))) files))))))
+
 (deftest list-items-keyset-and-filters
   (let [dir (temp-dir)]
     (try

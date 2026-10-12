@@ -84,6 +84,30 @@
 (defn- delete-blob-file! [dir ref]
   (.delete (io/file dir ref)))
 
+;; --- in-flight blob ref registry (M4 orphan-sweep safety) -------------------
+
+(def ^:private in-flight-refs (atom {})) ;; ref -> registration count
+
+(defn- register-blob-ref! [ref]
+  ;; counter, not a set: two concurrent creates of the same ref (identical
+  ;; name + content) may be registered at once and each must unregister once
+  (swap! in-flight-refs update ref (fnil inc 0)))
+
+(defn- unregister-blob-ref! [ref]
+  (swap! in-flight-refs
+         (fn [m]
+           (let [n (dec (long (get m ref 0)))]
+             (if (pos? n) (assoc m ref n) (dissoc m ref))))))
+
+(defn in-flight-blob-ref?
+  "True while a create-item! for this blob ref has not yet resolved: the ref
+   is registered BEFORE the blob file is written and unregistered after the
+   insert transaction commits or rolls back. The orphan sweep checks this
+   immediately before unlinking, so it can never remove the blob of a create
+   in flight."
+  [ref]
+  (contains? @in-flight-refs ref))
+
 ;; --- connections and write transactions --------------------------------------
 
 (defn- busy? [e]
@@ -170,7 +194,13 @@
   (get-blob [store ref]
     "Blob bytes for a storage_ref, nil when absent or ref-shaped invalid.")
   (delete-blob! [store ref]
-    "Remove a blob; always true, even for invalid or already-gone refs."))
+    "Remove a blob; always true, even for invalid or already-gone refs.")
+  (blob-referenced? [store ref]
+    "True when ANY items row carries this storage_ref — including rows that
+     are expired but not yet collected. Fresh parameterized query, no cache.")
+  (list-blob-files [store]
+    "Vector of {:ref ... :mtime-ms ...} for every file under the blob root
+     (the orphan sweep's candidate list)."))
 
 ;; --- SQLite + filesystem implementation --------------------------------------
 
@@ -184,22 +214,30 @@
       (names/unique-name
         (fn [raw]
           (let [nm (names/normalize raw)
-                ref (put-blob! this nm content)]
+                ref (blob-ref sha nm)]
+            ;; register before the file exists: from the moment the write makes
+            ;; the file visible to a directory listing, the sweep's unlink-time
+            ;; check sees the registration and skips it
+            (register-blob-ref! ref)
             (try
-              (with-write-tx conn
-                (fn []
-                  (let [now (Instant/now)
-                        [ttl expires] (ttl-fields now (:ttl_seconds opts))]
-                    (jdbc/execute! conn
-                      ["INSERT INTO items (name, description, mime_type, content_kind, size_bytes, checksum_sha256, storage_ref, ttl_seconds, created_at, expires_at, owner_key_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-                       nm (:description opts) mime kind (alength content) sha ref
-                       ttl (iso-utc now) expires (:owner_key_id opts)])
-                    (jdbc/fetch-one conn ["SELECT * FROM items WHERE name = ?" nm]))))
-              (catch Throwable t
-                (delete-blob-file! dir ref)
-                (if (name-taken? t)
-                  (throw (names/taken "name already used"))
-                  (throw t)))))))))
+              (put-blob! this nm content)
+              (try
+                (with-write-tx conn
+                  (fn []
+                    (let [now (Instant/now)
+                          [ttl expires] (ttl-fields now (:ttl_seconds opts))]
+                      (jdbc/execute! conn
+                        ["INSERT INTO items (name, description, mime_type, content_kind, size_bytes, checksum_sha256, storage_ref, ttl_seconds, created_at, expires_at, owner_key_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                         nm (:description opts) mime kind (alength content) sha ref
+                         ttl (iso-utc now) expires (:owner_key_id opts)])
+                      (jdbc/fetch-one conn ["SELECT * FROM items WHERE name = ?" nm]))))
+                (catch Throwable t
+                  (delete-blob-file! dir ref)
+                  (if (name-taken? t)
+                    (throw (names/taken "name already used"))
+                    (throw t))))
+              (finally
+                (unregister-blob-ref! ref))))))))
 
   (get-item [_ nm]
     (jdbc/fetch-one conn
@@ -327,7 +365,22 @@
   (delete-blob! [_ ref]
     (when (valid-blob-ref? ref)
       (delete-blob-file! dir ref))
-    true))
+    true)
+
+  (blob-referenced? [_ ref]
+    (some? (jdbc/fetch-one conn ["SELECT 1 AS hit FROM items WHERE storage_ref = ? LIMIT 1" ref])))
+
+  (list-blob-files [_]
+    (let [root (io/file dir "blobs")
+          prefix (inc (count (.getPath root)))]
+      (into []
+            (comp (filter #(.isFile ^java.io.File %))
+                  (map (fn [^java.io.File f]
+                         {:ref (str "blobs/"
+                                    (str/replace (subs (.getPath f) prefix)
+                                                 java.io.File/separator "/"))
+                          :mtime-ms (.lastModified f)})))
+            (file-seq root)))))
 
 ;; --- lifecycle ---------------------------------------------------------------
 
