@@ -26,7 +26,8 @@
     (is (nil? (:admin_token cfg)))
     (is (= 8080 (:port cfg)))
     (is (= "" (:path_prefix cfg)))
-    (is (= "mp_dev_devkey" (:dev_api_key cfg)))))
+    (is (= "mp_dev_devkey" (:dev_api_key cfg)))
+    (is (= 3600 (:cleanup_interval_s cfg)))))
 
 (deftest precedence-env-over-file-over-default
   (with-config-file
@@ -84,7 +85,10 @@
               (config/load-config {:env {} :config-file path}))))))
   (testing "explicit config file path that does not exist"
     (is (thrown-with-msg? Exception #"not found"
-          (config/load-config {:env {} :config-file "target/test-config/nope.edn"})))))
+          (config/load-config {:env {} :config-file "target/test-config/nope.edn"}))))
+  (testing "cleanup_interval_s below 1"
+    (is (thrown-with-msg? Exception #"cleanup_interval_s"
+          (config/load-config {:env {"METAPASTE_CLEANUP_INTERVAL_S" "0"}})))))
 
 (deftest unknown-keys-warn
   (let [{:keys [warnings]} (config/load-config {:env {"METAPASTE_BOGUS" "1"
@@ -100,9 +104,11 @@
 
 (deftest env-coercion
   (let [cfg (config/load-config {:env {"METAPASTE_ALLOW_NEVER_EXPIRE" "yes"
-                                       "METAPASTE_MIN_TTL_SECONDS" "120"}})]
+                                       "METAPASTE_MIN_TTL_SECONDS" "120"
+                                       "METAPASTE_CLEANUP_INTERVAL_S" "1"}})]
     (is (= true (:allow_never_expire cfg)))
-    (is (= 120 (:min_ttl_seconds cfg)))))
+    (is (= 120 (:min_ttl_seconds cfg)))
+    (is (= 1 (:cleanup_interval_s cfg)))))
 
 (deftest redact-hides-secrets
   (let [cfg (config/load-config {:env {"METAPASTE_ADMIN_TOKEN" "super-secret-token-xyz"}})
