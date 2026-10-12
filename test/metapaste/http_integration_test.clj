@@ -8,6 +8,7 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [jdbc.core :as jdbc]
             [jolt.http-client :as http]
+            [metapaste.auth :as auth]
             [metapaste.config :as config]
             [metapaste.http :as mhttp]
             [metapaste.storage :as storage])
@@ -32,10 +33,26 @@
 (defn- store* [] (:store @live))
 (defn- data-dir [] (:dir @live))
 
+;; plaintext secret of a real key created by the fixture — the M3 fixed dev
+;; key grants nothing since M5
+(def ^:private bearer (atom nil))
+
+(defn- auth-headers []
+  {"authorization" (str "Bearer " @bearer)})
+
 (defn- once-fixture [f]
   (let [dir (temp-dir)
-        cfg (assoc (config/load-config {:env {}}) :port 0)
+        cfg (assoc (config/load-config {:env {}})
+                   :port 0
+                   ;; the suite fires hundreds of requests in seconds; give it
+                   ;; rate-limit headroom so integration traffic never 429s
+                   ;; (Q31 enforcement itself is tested in auth-test)
+                   :rate_limit_rps 100000
+                   :rate_limit_burst 1000000)
         store (storage/open! dir)
+        _ (reset! bearer (:secret (auth/create-key! store
+                                                     {:label "integration"
+                                                      :scopes "read,write"})))
         handle (mhttp/start-server! store cfg {:port 0})]
     (try
       (reset! live {:base (str "http://127.0.0.1:" (:port handle))
@@ -51,18 +68,16 @@
 
 ;; --- request helpers ---------------------------------------------------------
 
-(def ^:private auth {"authorization" "Bearer mp_dev_devkey"})
-
 (defn- call
   "http/request that never throws on status. Opts: :headers merged over the
-   dev auth header, :no-auth true sends no Authorization at all."
+   bearer auth header, :no-auth true sends no Authorization at all."
   [method path & [opts]]
   (let [opts (merge {:request-method method
                      :url (str (base) path)
                      :throw-exceptions false}
                     opts)
         opts (cond-> (dissoc opts :no-auth)
-               (not (:no-auth opts)) (update :headers #(merge auth %)))]
+               (not (:no-auth opts)) (update :headers #(merge (auth-headers) %)))]
     (http/request opts)))
 
 (defn- call-json [method path body & [opts]]
@@ -416,7 +431,7 @@
       ;; (PrintWriter hits a jolt shim cast bug — write raw bytes instead)
       (.write out (.getBytes (str "POST /api/v1/items HTTP/1.1\r\n"
                                   "Host: 127.0.0.1\r\n"
-                                  "Authorization: Bearer mp_dev_devkey\r\n"
+                                  "Authorization: Bearer " @bearer "\r\n"
                                   "Content-Type: application/json\r\n"
                                   "Connection: close\r\n\r\n")
                              "UTF-8"))
@@ -457,7 +472,7 @@
                 415 "unsupported-media-type")))
 
 (deftest errors-401-and-405
-  (testing "401 missing or wrong bearer (M3 stub auth, TODO(M5))"
+  (testing "401 missing or wrong bearer (M5 API-key auth)"
     (is (problem? (call :get "/api/v1/items" {:no-auth true})
                   401 "unauthorized"))
     (is (problem? (call :get "/api/v1/items"

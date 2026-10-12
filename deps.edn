@@ -19,6 +19,8 @@
                                       :git/sha "abafb1186f533af9df3bf30d30c0bc56a234c8fc"
                                       :exclusions [jolt-lang/jolt-crypto]}
          metosin/reitit-core {:mvn/version "0.10.1"}
+         ;; M5: mandated constant-time compare for secrets/hashes (RQ12/Cabal)
+         crypto-equality/crypto-equality {:mvn/version "1.0.1"}
          ;; reitit-core's Trie host class (reitit-core itself is unmodified on jolt)
          jolt-lang/router {:git/url "https://github.com/jolt-lang/router"
                            :git/sha "1056e782a80ee8cf54276f639f97811b619bbc47"
