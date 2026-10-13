@@ -8,7 +8,10 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [metapaste.auth :as auth]
+            [metapaste.cleanup :as cleanup]
+            [metapaste.config :as config]
             [metapaste.log :as log]
+            [metapaste.metrics :as metrics]
             [metapaste.names :as names]
             [metapaste.ratelimit :as ratelimit]
             [metapaste.storage :as storage])
@@ -72,6 +75,32 @@
   {:status status
    :headers {"Content-Type" "application/json"}
    :body (json/write-str m :escape-slash false :escape-unicode false)})
+
+(defn- no-content []
+  {:status 204 :headers {}})
+
+(defn- accepted-key
+  "M5 admin-token check (constant-time). Returns the presented token when
+   accepted (Bearer prefix tolerated), else nil."
+  [ctx request]
+  (let [raw (get-in request [:headers "authorization"])
+        presented (if (and raw (str/starts-with? (str/lower-case raw) "bearer "))
+                    (subs raw 7)
+                    raw)]
+    (when (auth/admin-token-ok? (:config ctx) presented)
+      presented)))
+
+(defn- record-http!
+  "Q47 request counters/histogram. route is the MATCHED TEMPLATE (never the
+   raw URI), so item names and key ids never become label values."
+  [route method status t0]
+  (metrics/inc! :http_requests_total
+                {:route (or route "unmatched")
+                 :method (str/upper-case (name method))
+                 :status (long status)})
+  (metrics/observe! :http_request_duration_seconds
+                    {:route (or route "unmatched")}
+                    (/ (- (System/currentTimeMillis) t0) 1000.0)))
 
 ;; --- validation (Q6, Q9, Q32-Q35) -------------------------------------------
 
@@ -655,10 +684,117 @@
     (problem 503 "not-ready" detail)
     (json-response 200 {:status "ok"})))
 
+;; --- management /manage/v1 (admin token, Q27/Q52) ----------------------------
+
+(defn manage-stats
+  "GET /manage/v1/stats: live item count, expired-but-uncollected count, total
+   bytes, oldest/newest created_at, active key count (snake_case JSON keys)."
+  [ctx request]
+  (let [s (storage/stats (:store ctx))]
+    (json-response 200 {:items_live (:items-live s)
+                        :items_expired (:items-expired s)
+                        :bytes_total (:bytes-total s)
+                        :oldest_created (:oldest-created s)
+                        :newest_created (:newest-created s)
+                        :api_keys_active (:api-keys-active s)})))
+
+(defn manage-cleanup
+  "POST /manage/v1/cleanup: synchronous run-cleanup-once!, returns its result
+   map {:deleted :orphans :duration-ms}."
+  [ctx request]
+  (json-response 200 (cleanup/run-cleanup-once! (:store ctx))))
+
+(defn manage-list-keys
+  "GET /manage/v1/keys: public key fields only — never secrets or hashes."
+  [ctx request]
+  (json-response 200 {:keys (storage/list-api-keys (:store ctx))}))
+
+(defn manage-create-key
+  "POST /manage/v1/keys: create an API key. The response carries the plaintext
+   secret exactly once (never logged, never listed afterwards)."
+  [ctx request]
+  (if-not (json-content-type? request)
+    (not-json-415)
+    (let [parsed (json-body request (request-body-cap
+                                      (:max_item_bytes (:config ctx))))]
+      (if-let [st (:status parsed)]
+        (problem st (:slug parsed) (:detail parsed))
+        (let [m (:value parsed)]
+          (cond
+            (not (map? m))
+            (problem 400 "validation-failed" "request body must be a JSON object")
+
+            (or (not (string? (:label m))) (str/blank? (:label m)))
+            (problem 400 "validation-failed" "label is required")
+
+            :else
+            (try
+              (json-response 201
+                             (auth/create-key! (:store ctx)
+                                               {:label (:label m)
+                                                :scopes (:scopes m)}))
+              (catch clojure.lang.ExceptionInfo e
+                (problem 400 "validation-failed" (ex-message e))))))))))
+
+(defn manage-revoke-key
+  "DELETE /manage/v1/keys/:key_id: revoke (204 once, then 404; unknown 404)."
+  [ctx request]
+  (if (auth/revoke-key! (:store ctx) (get-in request [:path-params :key_id]))
+    (no-content)
+    (problem 404 "not-found" "key not found or already revoked")))
+
+(defn manage-purge-item
+  "DELETE /manage/v1/items/:name: admin purge — bypasses ownership, deletes any
+   live item; 404 for unknown or expired names."
+  [ctx request]
+  (if (storage/delete-item! (:store ctx) (get-in request [:path-params :name]))
+    (no-content)
+    (problem 404 "not-found" "item not found or expired")))
+
+(defn manage-config
+  "GET /manage/v1/config: effective config (schema defaults merged over the
+   startup config) with secrets redacted via M1's redact-config. Read-only."
+  [ctx request]
+  (json-response 200 (config/redact-config
+                       (merge config/defaults (:config ctx)))))
+
+;; --- request metrics (Q47): called from dispatch ------------------------------
+
+(defn- call-handler
+  "Run one handler, catching storage failures to increment
+   storage_errors_total and answer 500 problem+json (never leak internals).
+   Returns the response."
+  [ctx request handler t0]
+  (try
+    (let [resp (handler ctx request)]
+      (record-http! (:route request) (:request-method request)
+                    (:status resp) t0)
+      (when (#{:post :put :patch :delete} (:request-method request))
+        (when-not (str/includes? (str (get-in request [:headers "content-type"]) "")
+                                 "multipart")
+          (metrics/inc! :uploaded_bytes_total {}
+                        (if-let [cl (get-in request [:headers "content-length"])]
+                          (Long/parseLong (str/trim cl))
+                          0))))
+      (when (and (= 200 (:status resp))
+                 (= :get (:request-method request))
+                 (str/includes? (str (:route request)) "/content")
+                 (string? (:body resp)))
+        (metrics/inc! :downloaded_bytes_total {} (count (.getBytes ^String (:body resp) "UTF-8"))))
+      (when (and (= 201 (:status resp)) (= :post (:request-method request))
+                 (str/includes? (str (:route request)) "/items"))
+        (metrics/inc! :items_created_total {}))
+      resp)
+    (catch Throwable t
+      (record-http! (:route request) (:request-method request) 500 t0)
+      (metrics/inc! :storage_errors_total {})
+      (problem 500 "internal-error" "internal error"))))
+
 ;; --- routing / dispatch ------------------------------------------------------
 
 (defn- route-table [cfg]
   (let [items (str (api-base cfg) "/items")
+        m (str (:path_prefix cfg) "/manage/v1")
         p (:path_prefix cfg)]
     [[(str p "/healthz") {:kind :public :get #'healthz}]
      [(str p "/readyz") {:kind :public :get #'readyz}]
@@ -666,7 +802,14 @@
      [(str items "/:name") {:get #'get-item
                             :patch #'patch-item
                             :delete #'delete-item}]
-     [(str items "/:name/content") {:get #'get-content}]]))
+     [(str items "/:name/content") {:get #'get-content}]
+     [(str m "/stats") {:kind :manage :get #'manage-stats}]
+     [(str m "/cleanup") {:kind :manage :post #'manage-cleanup}]
+     [(str m "/keys") {:kind :manage :get #'manage-list-keys
+                       :post #'manage-create-key}]
+     [(str m "/keys/:key_id") {:kind :manage :delete #'manage-revoke-key}]
+     [(str m "/items/:name") {:kind :manage :delete #'manage-purge-item}]
+     [(str m "/config") {:kind :manage :get #'manage-config}]]))
 
 (def ^:private http-methods #{:get :post :put :patch :delete :head :options})
 
@@ -676,26 +819,37 @@
 
 (defn- dispatch
   "Route match -> 404 -> method 405 -> kind: :public handlers run unguarded;
-   :api runs the auth chain (401/403/429) then the ownership gate (403) then
-   the handler. Returns [response key-id]; key-id is the authenticated key
-   (nil when the request never got that far), for the request log line."
-  [ctx request]
+   :manage requires the admin token (401 problem+json otherwise) and marks
+   the request :admin; :api runs the auth chain (401/403/429) then the
+   ownership gate (403) then the handler. Returns [response key-id]; key-id is
+   the authenticated key (nil when the request never got that far), for the
+   request log line."
+  [ctx request t0]
   (let [router (:router ctx)]
     (if-let [match (reitit/match-by-path router (:uri request))]
       (let [data (:data match)
-            method (:request-method request)]
+            method (:request-method request)
+            request (assoc request
+                           :path-params (:path-params match)
+                           :route (:template match))]
         (if-let [handler (get data method)]
-          (if (= :public (:kind data))
-            [(handler ctx (assoc request :path-params (:path-params match))) nil]
+          (case (:kind data)
+            :public
+            [(call-handler ctx request handler t0) nil]
+
+            :manage
+            (if (accepted-key ctx request)
+              [(call-handler ctx (assoc request :admin true) handler t0) nil]
+              [(problem 401 "unauthorized" "admin token required") nil])
+
             (let [authz (authorize ctx request method)]
               (if-let [resp (:response authz)]
                 [resp (:key-id authz)]
-                (let [req (assoc (:request authz)
-                                 :path-params (:path-params match))
+                (let [req (:request authz)
                       forbidden (ownership-gate ctx req)]
                   (if forbidden
                     [forbidden (:key-id authz)]
-                    [(handler ctx req) (:key-id authz)])))))
+                    [(call-handler ctx req handler t0) (:key-id authz)])))))
           [(problem 405 "method-not-allowed"
                     (str (str/upper-case (name method)) " not allowed on this path")
                     {"Allow" (allow-header data)})
@@ -716,7 +870,7 @@
       (let [rid (request-id request)
             t0 (System/currentTimeMillis)]
         (log/with-request-id rid
-          (let [[resp key-id] (dispatch ctx request)
+          (let [[resp key-id] (dispatch ctx request t0)
                 resp (assoc-in resp [:headers "X-Request-Id"] rid)]
             (log/info "request" {:method (:request-method request)
                                  :route (:uri request)
