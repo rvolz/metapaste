@@ -276,6 +276,51 @@
       (is (string? (:oldest-created st)))
       (is (string? (:newest-created st))))))
 
+(deftest stats-active-keys-count
+  (with-store [store dir]
+    (let [at (storage/iso-utc (Instant/now))]
+      (storage/create-api-key! store {:key_id "aaaaaaaa" :key_hash "h1"
+                                      :label "one" :scopes "read"
+                                      :created_at at})
+      (storage/create-api-key! store {:key_id "bbbbbbbb" :key_hash "h2"
+                                      :label "two" :scopes "read,write"
+                                      :created_at at})
+      (storage/revoke-api-key! store "bbbbbbbb" at))
+    (let [st (storage/stats store)]
+      (is (= 2 (long (:api-keys st))))
+      (testing "active = not revoked (M6 GET /stats)"
+        (is (= 1 (long (:api-keys-active st))))))))
+
+(deftest list-api-keys-projected-fields
+  (with-store [store dir]
+    (let [at (storage/iso-utc (Instant/now))]
+      (storage/create-api-key! store {:key_id "aaaaaaaa" :key_hash "h1"
+                                      :label "one" :scopes "read"
+                                      :created_at at})
+      (storage/create-api-key! store {:key_id "bbbbbbbb" :key_hash "h2"
+                                      :label "two" :scopes "read,write"
+                                      :created_at at})
+      (storage/revoke-api-key! store "bbbbbbbb" at))
+    (let [rows (storage/list-api-keys store)
+          by-id (into {} (map (juxt :key_id identity)) rows)]
+      (is (= ["aaaaaaaa" "bbbbbbbb"] (mapv :key_id rows)))
+      (testing "listing carries exactly the public fields — no key_hash"
+        (is (every? #(= #{:key_id :label :scopes :created_at :revoked_at}
+                        (set (keys %)))
+                    rows)))
+      (is (= "one" (:label (by-id "aaaaaaaa"))))
+      (is (= "read,write" (:scopes (by-id "bbbbbbbb"))))
+      (is (nil? (:revoked_at (by-id "aaaaaaaa"))))
+      (is (string? (:revoked_at (by-id "bbbbbbbb")))))))
+
+(deftest migrations-current-check
+  (with-store [store dir]
+    (is (true? (storage/migrations-current? store)))
+    (with-db-conn dir
+      (fn [c] (jdbc/execute! c ["DELETE FROM schema_migrations"])))
+    (testing "a missing applied migration makes readiness false"
+      (is (false? (storage/migrations-current? store))))))
+
 ;; --- M4: in-flight blob ref registry + orphan-sweep interface members -------
 
 (defn- spy-blob-write!
