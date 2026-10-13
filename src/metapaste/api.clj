@@ -53,7 +53,8 @@
    413 "Payload Too Large"
    415 "Unsupported Media Type"
    429 "Too Many Requests"
-   500 "Internal Server Error"})
+   500 "Internal Server Error"
+   503 "Service Unavailable"})
 
 (defn problem
   "RFC 7807 problem+json response; type/title/status/detail always present."
@@ -614,11 +615,54 @@
         (json-response 200 {:items (mapv #(item-metadata cfg %) page)
                             :next_cursor next-cursor})))))
 
+;; --- health (Q51): /healthz + /readyz, no auth --------------------------------
+
+(defn healthz [ctx request]
+  (json-response 200 {:status "ok"}))
+
+(def ^:private probe-cache-ttl-ms 5000)
+
+(defonce ^:private probe-cache (atom {:at 0 :ok false :detail nil}))
+
+(defn- cached-write-probe
+  "Storage write probe result, cached for probe-cache-ttl-ms either way (Q51:
+   the readiness probe runs at most every 5 s)."
+  [ctx]
+  (let [{:keys [at ok detail]} @probe-cache
+        now (System/currentTimeMillis)]
+    (if (< (- now at) probe-cache-ttl-ms)
+      [ok detail]
+      (let [result (try
+                     (storage/probe-writable! (:store ctx))
+                     [true nil]
+                     (catch Throwable t [false (ex-message t)]))]
+        (reset! probe-cache {:at now :ok (first result) :detail (second result)})
+        result))))
+
+(defn- readiness-detail
+  "nil when ready (migrations current AND storage writable), else the reason."
+  [ctx]
+  (or (when-not (try
+                  (storage/migrations-current? (:store ctx))
+                  (catch Throwable _ false))
+        "database migrations are not current")
+      (let [[ok detail] (cached-write-probe ctx)]
+        (when-not ok
+          (or detail "storage is not writable")))))
+
+(defn readyz [ctx request]
+  (if-let [detail (readiness-detail ctx)]
+    (problem 503 "not-ready" detail)
+    (json-response 200 {:status "ok"})))
+
 ;; --- routing / dispatch ------------------------------------------------------
 
 (defn- route-table [cfg]
-  (let [items (str (api-base cfg) "/items")]
-    [[items {:get #'list-items :post #'create-item}]
+  (let [items (str (api-base cfg) "/items")
+        p (:path_prefix cfg)]
+    [[(str p "/healthz") {:kind :public :get #'healthz}]
+     [(str p "/readyz") {:kind :public :get #'readyz}]
+     [items {:get #'list-items :post #'create-item}]
      [(str items "/:name") {:get #'get-item
                             :patch #'patch-item
                             :delete #'delete-item}]
@@ -631,25 +675,27 @@
                       (filter http-methods (keys data)))))
 
 (defn- dispatch
-  "Route match -> 404 -> method 405 -> authorize (401/403/429) -> ownership
-   gate for PATCH/DELETE (403) -> handler. Returns [response key-id]; key-id
-   is the authenticated key (nil when the request never got that far), for
-   the request log line."
+  "Route match -> 404 -> method 405 -> kind: :public handlers run unguarded;
+   :api runs the auth chain (401/403/429) then the ownership gate (403) then
+   the handler. Returns [response key-id]; key-id is the authenticated key
+   (nil when the request never got that far), for the request log line."
   [ctx request]
   (let [router (:router ctx)]
     (if-let [match (reitit/match-by-path router (:uri request))]
       (let [data (:data match)
             method (:request-method request)]
         (if-let [handler (get data method)]
-          (let [authz (authorize ctx request method)]
-            (if-let [resp (:response authz)]
-              [resp (:key-id authz)]
-              (let [req (assoc (:request authz)
-                               :path-params (:path-params match))
-                    forbidden (ownership-gate ctx req)]
-                (if forbidden
-                  [forbidden (:key-id authz)]
-                  [(handler ctx req) (:key-id authz)]))))
+          (if (= :public (:kind data))
+            [(handler ctx (assoc request :path-params (:path-params match))) nil]
+            (let [authz (authorize ctx request method)]
+              (if-let [resp (:response authz)]
+                [resp (:key-id authz)]
+                (let [req (assoc (:request authz)
+                                 :path-params (:path-params match))
+                      forbidden (ownership-gate ctx req)]
+                  (if forbidden
+                    [forbidden (:key-id authz)]
+                    [(handler ctx req) (:key-id authz)])))))
           [(problem 405 "method-not-allowed"
                     (str (str/upper-case (name method)) " not allowed on this path")
                     {"Allow" (allow-header data)})

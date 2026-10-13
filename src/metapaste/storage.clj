@@ -427,6 +427,18 @@
 
 ;; --- lifecycle ---------------------------------------------------------------
 
+(defn probe-writable!
+  "Readiness write probe (Q51): create+delete a probe file in the data dir,
+   then a no-op BEGIN IMMEDIATE/ROLLBACK on the connection. Returns true;
+   throws when storage is not writable."
+  [store]
+  (let [f (io/file (:dir store) ".readyz-probe")]
+    (spit f "ok")
+    (.delete f)
+    (jdbc/execute! (:conn store) ["BEGIN IMMEDIATE"])
+    (jdbc/execute! (:conn store) ["ROLLBACK"])
+    true))
+
 (defn open!
   "Open the store rooted at dir (created if absent): applies pending
    migrations — re-running against an already-migrated database is a no-op —

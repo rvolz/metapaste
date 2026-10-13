@@ -351,3 +351,113 @@
                 (is (nil? (:expires_at pm))))))
           (finally (storage/close-storage store))))
       (finally (delete-recursively! dir)))))
+
+;; --- M6: health (Q51) --------------------------------------------------------
+
+(defn- health-handler [store]
+  (api/make-handler {:store store
+                     :config (handler-cfg {})
+                     :multipart-parser (fn [_] nil)}))
+
+(defn- call
+  "Ring call with no body/auth; returns the raw response."
+  ([handler method uri] (call handler method uri {}))
+  ([handler method uri headers]
+   (handler {:request-method method :uri uri :headers headers})))
+
+(deftest healthz-always-200
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (health-handler store)
+                resp (call h :get "/healthz")]
+            (is (= 200 (:status resp)))
+            (is (= "application/json" (get-in resp [:headers "Content-Type"])))
+            (is (= {:status "ok"} (json/read-str (:body resp) :key-fn keyword))))
+          (testing "liveness ignores storage writability (Q51)"
+            (.setWritable dir false)
+            (try
+              (is (= 200 (:status (call (health-handler store) :get "/healthz"))))
+              (finally (.setWritable dir true))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest readyz-200-when-ready
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [resp (call (health-handler store) :get "/readyz")]
+            (is (= 200 (:status resp)) (pr-str resp))
+            (is (= {:status "ok"} (json/read-str (:body resp) :key-fn keyword))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest readyz-503-when-migrations-missing
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (with-db-conn dir
+            (fn [c] (jdbc/execute! c ["DELETE FROM schema_migrations"])))
+          (let [resp (call (health-handler store) :get "/readyz")]
+            (is (= 503 (:status resp)))
+            (is (= "application/problem+json" (get-in resp [:headers "Content-Type"])))
+            (let [m (json/read-str (:body resp) :key-fn keyword)]
+              (is (= "urn:metapaste:problem:not-ready" (:type m)))
+              (is (= 503 (:status m)))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest readyz-503-chmod-unwritable-recovers
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)
+            ttl-var (ns-resolve 'metapaste.api 'probe-cache-ttl-ms)
+            cache-var (ns-resolve 'metapaste.api 'probe-cache)]
+        (try
+          (with-redefs-fn
+            {ttl-var 0
+             cache-var (atom {:at 0 :ok false :detail nil})}
+            (fn []
+              (is (= 200 (:status (call (health-handler store) :get "/readyz"))))
+              (.setWritable dir false)
+              (try
+                (let [canary (java.io.File. dir "canary")]
+                  (spit canary "x")
+                  (.delete canary))
+                ;; chmod had no effect (root or exotic FS): skip with a note
+                (println "note: chmod-unwritability untestable on this platform;"
+                         "skipping the readyz 503 half")
+                (is (= 200 (:status (call (health-handler store) :get "/readyz"))))
+                (catch java.io.IOException _
+                  (let [resp (call (health-handler store) :get "/readyz")]
+                    (is (= 503 (:status resp)) (pr-str resp))
+                    (is (= "application/problem+json"
+                           (get-in resp [:headers "Content-Type"]))))
+                  (.setWritable dir true)
+                  (is (= 200 (:status (call (health-handler store) :get "/readyz")))
+                      "recovers after chmod back"))
+                (finally (.setWritable dir true)))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest readyz-caches-write-probe
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)
+            probe-var (ns-resolve 'metapaste.storage 'probe-writable!)
+            real-fn @probe-var
+            calls (atom 0)]
+        (try
+          (reset! @(ns-resolve 'metapaste.api 'probe-cache) {:at 0 :ok false :detail nil})
+          (with-redefs-fn
+            {probe-var (fn [s] (swap! calls inc) (real-fn s))}
+            (fn []
+              ;; real TTL (5000 ms): two hits share ONE probe
+              (is (= 200 (:status (call (health-handler store) :get "/readyz"))))
+              (is (= 200 (:status (call (health-handler store) :get "/readyz"))))
+              (is (= 1 @calls))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
