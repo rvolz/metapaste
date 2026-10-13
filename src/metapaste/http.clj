@@ -72,17 +72,33 @@
   [handle]
   (adapter/stop-server handle))
 
+(defn start-metrics-server!
+  "Start the INTERNAL metrics listener (Q46/Q47): GET /metrics on :metrics_port
+   (default main+1), a second socket of the same adapter — not a route on the
+   public table. opts override {:port :host}. Returns the adapter handle."
+  ([cfg] (start-metrics-server! cfg {}))
+  ([cfg {:keys [port host]}]
+   (adapter/run-server api/metrics-handler
+                       {:port (if (nil? port) (:metrics_port cfg) port)
+                        :host (or host "127.0.0.1")
+                        :strategy :threads
+                        ;; scrapes carry no body; cap is transport hygiene only
+                        :max-request-bytes 65536})))
+
 (defn serve!
   "CLI `metapaste serve`: load config, open storage at :data_dir, start the
-   adapter on :port, log a startup line, block forever (a jolt thread does not
-   keep the process alive after main returns — serve must own its lifetime)."
+   adapter on :port plus the internal metrics listener on :metrics_port, log a
+   startup line, block forever (a jolt thread does not keep the process alive
+   after main returns — serve must own its lifetime)."
   []
   (let [cfg (config/load-config)]
     (doseq [w (:warnings cfg)]
       (log/warn w))
     (let [store (storage/open! (:data_dir cfg))
-          handle (start-server! store cfg)]
+          handle (start-server! store cfg)
+          metrics-handle (start-metrics-server! cfg)]
       (log/info "metapaste serving" {:port (:port handle)
+                                     :metrics_port (:port metrics-handle)
                                      :path_prefix (:path_prefix cfg)
                                      :data_dir (:data_dir cfg)})
       @(promise))))

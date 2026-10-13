@@ -176,6 +176,9 @@
      :description, :content_kind, :ttl_seconds, :owner_key_id; returns the row.")
   (get-item [store name]
     "Row map for a case-insensitive name, nil when unknown or expired.")
+  (expired-item? [store name]
+    "True when a row with this name exists but is expired (read-path expiry
+     attribution for items_expired_total); false for unknown or live names.")
   (update-item! [store name patch]
     "Apply a partial patch (:description, :mime_type, :ttl_seconds); nil when
      the row is unknown or expired.")
@@ -255,6 +258,11 @@
     (jdbc/fetch-one conn
       ["SELECT * FROM items WHERE name = ? AND (expires_at IS NULL OR expires_at > ?)"
        (names/normalize nm) (iso-utc (Instant/now))]))
+
+  (expired-item? [_ nm]
+    (some? (jdbc/fetch-one conn
+            ["SELECT 1 AS one FROM items WHERE name = ? AND expires_at IS NOT NULL AND expires_at <= ?"
+             (names/normalize nm) (iso-utc (Instant/now))])))
 
   (update-item! [_ nm patch]
     (with-write-tx conn

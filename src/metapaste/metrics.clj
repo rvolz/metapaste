@@ -3,11 +3,13 @@
 
    Counters and histograms live in one atom; label values may only be
    route/method/status/le — never item names or key ids (Q47 cardinality
-   rule). cleanup_runs_total, cleanup_deleted_rows_total and
-   items_expired_total are sourced from metapaste.cleanup/counters at render
-   time so every cleanup pass counts no matter who triggered it; the
-   cleanup_duration_seconds histogram is observed per pass by the caller
-   (POST /manage/v1/cleanup)."
+   rule). cleanup_runs_total and cleanup_deleted_rows_total are sourced from
+   metapaste.cleanup/counters at render time so every cleanup pass counts no
+   matter who triggered it; the cleanup_duration_seconds histogram is observed
+   per pass through the observer hook metrics wires at load. items_expired_total
+   is recorded by the API read path (404s attributable to expiry) — cleanup's
+   own expired_deleted_total is not added again (that would double count a pass
+   that already reaped rows the read path saw)."
   (:require [clojure.string :as str]
             [metapaste.cleanup :as cleanup]))
 
@@ -30,7 +32,7 @@
    :items_deleted_total
    {:type :counter :help "Items deleted through the API, including admin purge."}
    :items_expired_total
-   {:type :counter :help "Expired item rows reclaimed by cleanup passes."}
+   {:type :counter :help "Read-path 404s attributable to expired-but-uncollected items (rows reaped by cleanup show in cleanup_deleted_rows_total)."}
    :cleanup_runs_total
    {:type :counter :help "Cleanup passes completed."}
    :cleanup_deleted_rows_total
@@ -41,9 +43,10 @@
    {:type :counter :help "Storage errors surfaced as exceptions while serving requests."}})
 
 (def ^:private derived
-  "Metric -> cleanup/counters snapshot key, read at render time."
-  {:items_expired_total :expired_deleted_total
-   :cleanup_runs_total :runs
+  "Metric -> cleanup/counters snapshot key, read at render time. items_expired_total
+   is NOT here: it counts read-path expiry misses recorded by the API, while
+   cleanup's expired_deleted_total feeds cleanup_deleted_rows_total."
+  {:cleanup_runs_total :runs
    :cleanup_deleted_rows_total :deleted_rows_total})
 
 (defonce ^:private state
@@ -93,6 +96,10 @@
    afterwards; call clear! first when data already exists."
   [k buckets]
   (swap! state assoc-in [:buckets k] (vec buckets)))
+
+;; Every completed cleanup pass observes cleanup_duration_seconds here, no
+;; matter who triggered the pass (worker, POST /manage/v1/cleanup, tests).
+(cleanup/set-observer! (fn [seconds] (observe! :cleanup_duration_seconds {} seconds)))
 
 (defn clear!
   "Reset every counter, histogram and bucket override (tests)."

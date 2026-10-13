@@ -165,8 +165,15 @@
   (metrics/clear!)
   (let [text (metrics/render)
         runs (re-find #"cleanup_runs_total (\d+)" text)
-        expired (re-find #"items_expired_total (\d+)" text)]
+        deleted (re-find #"cleanup_deleted_rows_total (\d+)" text)]
     (is (= [] (validate-exposition text)))
     (testing "sourced from metapaste.cleanup/counters, not local bookkeeping"
       (is (some? runs))
-      (is (some? expired)))))
+      (is (some? deleted)))))
+
+(deftest items-expired-total-is-recorded-locally
+  ;; read-path expiry attribution records into the registry; the cleanup
+  ;; snapshot must not mask local series (it did: derived map overrode them)
+  (metrics/clear!)
+  (metrics/inc! :items_expired_total {} 5)
+  (is (str/includes? (metrics/render) "items_expired_total 5")))

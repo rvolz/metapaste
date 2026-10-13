@@ -448,7 +448,9 @@
 (defn- create-item!
   [ctx cfg row-opts]
   (let [row (storage/create-item! (:store ctx) row-opts)]
-    (json-response 201 (item-metadata cfg row))))
+    (-> (json-response 201 (item-metadata cfg row))
+        ;; request-log fields + uploaded_bytes_total: what was accepted (Q48)
+        (assoc ::log-fields {:name (:name row) :size (:size_bytes row)}))))
 
 (defn- create-from-json [ctx request]
   (let [cfg (:config ctx)
@@ -548,6 +550,13 @@
       :else (problem 415 "unsupported-media-type"
                      "Content-Type must be application/json or multipart/form-data"))))
 
+(defn- count-expired-hit!
+  "Read-path expiry attribution (Q47 items_expired_total): only when the name
+   really is an expired-but-uncollected row, never for unknown names."
+  [ctx nm]
+  (when (storage/expired-item? (:store ctx) nm)
+    (metrics/inc! :items_expired_total {})))
+
 (defn get-item [ctx request]
   (let [cfg (:config ctx)
         nm (get-in request [:path-params :name])]
@@ -558,7 +567,8 @@
           {:status 304 :headers {"ETag" etag}}
           (assoc-in (json-response 200 (item-metadata cfg row))
                     [:headers "ETag"] etag)))
-      (problem 404 "not-found" "item not found or expired"))))
+      (do (count-expired-hit! ctx nm)
+          (problem 404 "not-found" "item not found or expired")))))
 
 (defn get-content [ctx request]
   (let [nm (get-in request [:path-params :name])
@@ -569,15 +579,18 @@
         (if (if-none-match? (get-in request [:headers "if-none-match"]) sha)
           {:status 304 :headers {"ETag" etag}}
           (if-let [blob (storage/get-blob store (:storage_ref row))]
-            {:status 200
-             :headers (merge {"Content-Type" (:mime_type row)
-                              "X-Content-Type-Options" "nosniff"
-                              "ETag" etag}
-                             (serving-headers (:mime_type row)
-                                              (:content_kind row)))
-             :body blob}
+            (-> {:status 200
+                 :headers (merge {"Content-Type" (:mime_type row)
+                                  "X-Content-Type-Options" "nosniff"
+                                  "ETag" etag}
+                                 (serving-headers (:mime_type row)
+                                                  (:content_kind row)))
+                 :body blob}
+                ;; request-log fields + downloaded_bytes_total (Q48)
+                (assoc ::log-fields {:name nm :size (alength ^bytes blob)}))
             (problem 500 "internal-error" "content missing from storage"))))
-      (problem 404 "not-found" "item not found or expired"))))
+      (do (count-expired-hit! ctx nm)
+          (problem 404 "not-found" "item not found or expired")))))
 
 (defn patch-item [ctx request]
   (let [cfg (:config ctx)
@@ -758,35 +771,33 @@
   (json-response 200 (config/redact-config
                        (merge config/defaults (:config ctx)))))
 
-;; --- request metrics (Q47): called from dispatch ------------------------------
+;; --- request side-effect metrics (Q47) ---------------------------------------
+
+(defn- record-side-effects!
+  "Item lifecycle counters derived from one dispatched response. Byte counts
+   come from the handler's ::log-fields (stored content bytes for uploads,
+   served bytes for downloads — JSON and multipart alike), so no request body
+   is re-measured here and no name/key id ever becomes a label value."
+  [request route resp]
+  (let [fields (::log-fields resp)]
+    (when-let [n (:size fields)]
+      (if (= :get (:request-method request))
+        (metrics/inc! :downloaded_bytes_total {} (long n))
+        (metrics/inc! :uploaded_bytes_total {} (long n))))
+    (when (and (= 201 (:status resp)) (= :post (:request-method request))
+               (str/includes? (str route) "/items"))
+      (metrics/inc! :items_created_total {}))
+    (when (and (= 204 (:status resp)) (= :delete (:request-method request))
+               (str/includes? (str route) "/items"))
+      (metrics/inc! :items_deleted_total {}))))
 
 (defn- call-handler
-  "Run one handler, catching storage failures to increment
-   storage_errors_total and answer 500 problem+json (never leak internals).
-   Returns the response."
-  [ctx request handler t0]
+  "Run one handler, catching failures to increment storage_errors_total and
+   answer 500 problem+json (never leak internals). Returns the response."
+  [ctx request handler]
   (try
-    (let [resp (handler ctx request)]
-      (record-http! (:route request) (:request-method request)
-                    (:status resp) t0)
-      (when (#{:post :put :patch :delete} (:request-method request))
-        (when-not (str/includes? (str (get-in request [:headers "content-type"]) "")
-                                 "multipart")
-          (metrics/inc! :uploaded_bytes_total {}
-                        (if-let [cl (get-in request [:headers "content-length"])]
-                          (Long/parseLong (str/trim cl))
-                          0))))
-      (when (and (= 200 (:status resp))
-                 (= :get (:request-method request))
-                 (str/includes? (str (:route request)) "/content")
-                 (string? (:body resp)))
-        (metrics/inc! :downloaded_bytes_total {} (count (.getBytes ^String (:body resp) "UTF-8"))))
-      (when (and (= 201 (:status resp)) (= :post (:request-method request))
-                 (str/includes? (str (:route request)) "/items"))
-        (metrics/inc! :items_created_total {}))
-      resp)
-    (catch Throwable t
-      (record-http! (:route request) (:request-method request) 500 t0)
+    (handler ctx request)
+    (catch Throwable _
       (metrics/inc! :storage_errors_total {})
       (problem 500 "internal-error" "internal error"))))
 
@@ -821,40 +832,42 @@
   "Route match -> 404 -> method 405 -> kind: :public handlers run unguarded;
    :manage requires the admin token (401 problem+json otherwise) and marks
    the request :admin; :api runs the auth chain (401/403/429) then the
-   ownership gate (403) then the handler. Returns [response key-id]; key-id is
-   the authenticated key (nil when the request never got that far), for the
-   request log line."
-  [ctx request t0]
+   ownership gate (403) then the handler. Returns [response key-id route]:
+   key-id is the authenticated key (nil when the request never got that far),
+   route is the matched template (nil when no route matched) — both feed the
+   request log line and request metrics."
+  [ctx request]
   (let [router (:router ctx)]
     (if-let [match (reitit/match-by-path router (:uri request))]
       (let [data (:data match)
             method (:request-method request)
+            route (:template match)
             request (assoc request
                            :path-params (:path-params match)
-                           :route (:template match))]
+                           :route route)]
         (if-let [handler (get data method)]
           (case (:kind data)
             :public
-            [(call-handler ctx request handler t0) nil]
+            [(call-handler ctx request handler) nil route]
 
             :manage
             (if (accepted-key ctx request)
-              [(call-handler ctx (assoc request :admin true) handler t0) nil]
-              [(problem 401 "unauthorized" "admin token required") nil])
+              [(call-handler ctx (assoc request :admin true) handler) nil route]
+              [(problem 401 "unauthorized" "admin token required") nil route])
 
             (let [authz (authorize ctx request method)]
               (if-let [resp (:response authz)]
-                [resp (:key-id authz)]
+                [resp (:key-id authz) route]
                 (let [req (:request authz)
                       forbidden (ownership-gate ctx req)]
                   (if forbidden
-                    [forbidden (:key-id authz)]
-                    [(call-handler ctx req handler t0) (:key-id authz)])))))
+                    [forbidden (:key-id authz) route]
+                    [(call-handler ctx req handler) (:key-id authz) route])))))
           [(problem 405 "method-not-allowed"
                     (str (str/upper-case (name method)) " not allowed on this path")
                     {"Allow" (allow-header data)})
-           nil]))
-      [(problem 404 "not-found" (str "no route for " (:uri request))) nil])))
+           nil route]))
+      [(problem 404 "not-found" (str "no route for " (:uri request))) nil nil])))
 
 (defn make-handler
   "Ring-style handler over plain request maps. ctx:
@@ -870,11 +883,55 @@
       (let [rid (request-id request)
             t0 (System/currentTimeMillis)]
         (log/with-request-id rid
-          (let [[resp key-id] (dispatch ctx request t0)
-                resp (assoc-in resp [:headers "X-Request-Id"] rid)]
-            (log/info "request" {:method (:request-method request)
-                                 :route (:uri request)
-                                 :status (:status resp)
-                                 :latency_ms (- (System/currentTimeMillis) t0)
-                                 :key_id key-id})
+          (let [[resp* key-id route] (dispatch ctx request)
+                fields (::log-fields resp*)
+                resp (-> resp*
+                         (dissoc ::log-fields)
+                         (assoc-in [:headers "X-Request-Id"] rid))]
+            ;; every dispatch outcome is counted (Q47), from the final status
+            (record-http! route (:request-method request) (:status resp) t0)
+            (record-side-effects! request route resp*)
+            (log/info "request"
+                      (cond-> {:method (str/upper-case (name (:request-method request)))
+                               :route (or route (:uri request))
+                               :status (:status resp)
+                               :latency_ms (- (System/currentTimeMillis) t0)}
+                        key-id (assoc :key_id key-id)
+                        (or (:name fields) (get-in request [:path-params :name]))
+                        (assoc :name (or (:name fields)
+                                         (get-in request [:path-params :name])))
+                        (:size fields) (assoc :size (:size fields))))
             resp))))))
+
+;; --- metrics endpoint (Q46): only on the internal listener --------------------
+
+(defn metrics-handler
+  "Ring handler for the INTERNAL metrics listener (never mounted on the public
+   route table): GET /metrics -> Prometheus text exposition 0.0.4, anything
+   else -> problem+json. Scrapes are logged like requests (request_id per Q50)
+   but never counted in http_requests_total — they are not API traffic."
+  [request]
+  (let [rid (request-id request)
+        t0 (System/currentTimeMillis)]
+    (log/with-request-id rid
+      (let [resp (cond
+                   (not= "/metrics" (:uri request))
+                   (problem 404 "not-found"
+                            "the metrics listener serves only GET /metrics")
+
+                   (not= :get (:request-method request))
+                   (problem 405 "method-not-allowed" "only GET is served here"
+                            {"Allow" "GET"})
+
+                   :else
+                   {:status 200
+                    :headers {"Content-Type"
+                              "text/plain; version=0.0.4; charset=utf-8"}
+                    :body (metrics/render)})]
+        (log/info "request" {:method (str/upper-case (name (:request-method request)))
+                             :route (if (= "/metrics" (:uri request))
+                                      "/metrics"
+                                      (:uri request))
+                             :status (:status resp)
+                             :latency_ms (- (System/currentTimeMillis) t0)})
+        (assoc-in resp [:headers "X-Request-Id"] rid)))))

@@ -33,10 +33,21 @@
   "Snapshot of the cleanup counters M6 will expose on /metrics. Exactly the
    six delta-5 keys; :last_cleanup_timestamp is epoch milliseconds and stays
    nil until a pass completes. :expired_deleted_total and :deleted_rows_total
-   both count rows reclaimed by the drain — kept as separate keys because
-   M6's exposition names them separately."
+   both count rows reclaimed by the drain; M6's exposition shows the latter as
+   cleanup_deleted_rows_total (expired_deleted_total stays internal)."
   []
   @counter-state)
+
+;; --- pass observer (M6: cleanup_duration_seconds) -----------------------------
+
+(defonce ^:private observer (atom nil))
+
+(defn set-observer!
+  "Install a 1-arg fn called with each completed pass's duration in SECONDS.
+   metapaste.metrics wires this to the cleanup_duration_seconds histogram at
+   load; cleanup never requires metrics itself (no require cycle)."
+  [f]
+  (reset! observer f))
 
 ;; --- delta 3: jitter ---------------------------------------------------------
 
@@ -109,6 +120,8 @@
                   (update :duration_ms_total + duration)
                   (update :orphans_swept_total + orphans)
                   (assoc :last_cleanup_timestamp completed))))
+     (when-let [f @observer]
+       (f (/ duration 1000.0)))
      {:deleted deleted :orphans orphans :duration-ms duration})))
 
 ;; --- interval worker ---------------------------------------------------------
@@ -116,18 +129,20 @@
 (defonce ^:private worker (atom nil))
 
 (defn- pass-loop [store running? interval-s grace-s rng]
-  (try
-    (while @running?
-      (try
-        (run-cleanup-once! store {:grace-s grace-s :stop? #(not @running?)})
-        (catch Throwable t
-          (log/error "cleanup pass failed" {:error (ex-message t)})))
-      (when @running?
+  ;; every background pass line is a job line: request_id "cleanup-job" (Q48)
+  (log/with-request-id "cleanup-job"
+    (try
+      (while @running?
         (try
-          (Thread/sleep (next-delay-ms (* 1000 (long interval-s)) rng))
-          (catch InterruptedException _ nil))))
-    (catch Throwable t
-      (log/error "cleanup worker stopped unexpectedly" {:error (ex-message t)}))))
+          (run-cleanup-once! store {:grace-s grace-s :stop? #(not @running?)})
+          (catch Throwable t
+            (log/error "cleanup pass failed" {:error (ex-message t)})))
+        (when @running?
+          (try
+            (Thread/sleep (next-delay-ms (* 1000 (long interval-s)) rng))
+            (catch InterruptedException _ nil))))
+      (catch Throwable t
+        (log/error "cleanup worker stopped unexpectedly" {:error (ex-message t)})))))
 
 (defn start!
   "Start the background interval worker. Idempotent — a second call returns
