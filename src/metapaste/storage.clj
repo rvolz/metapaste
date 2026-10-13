@@ -176,6 +176,9 @@
      :description, :content_kind, :ttl_seconds, :owner_key_id; returns the row.")
   (get-item [store name]
     "Row map for a case-insensitive name, nil when unknown or expired.")
+  (expired-item? [store name]
+    "True when a row with this name exists but is expired (read-path expiry
+     attribution for items_expired_total); false for unknown or live names.")
   (update-item! [store name patch]
     "Apply a partial patch (:description, :mime_type, :ttl_seconds); nil when
      the row is unknown or expired.")
@@ -187,6 +190,8 @@
      {:created-at :name}, :mime-prefix, :created-after, :created-before.")
   (stats [store]
     "Counts/sums for the metrics surface.")
+  (migrations-current? [store]
+    "True when every embedded migration id is recorded as applied (Q51 readyz).")
   (delete-expired-batch [store limit]
     "Delete up to limit expired rows, oldest first; returns deleted names.")
   (create-api-key! [store row]
@@ -196,6 +201,9 @@
     "api_keys row for a key_id (revoked rows included), nil when unknown.")
   (revoke-api-key! [store key-id revoked-at]
     "Stamp revoked_at when currently NULL; true only when a row changed.")
+  (list-api-keys [store]
+    "api_keys rows for GET /manage/v1/keys, oldest-created first: exactly the
+     public fields (key_id, label, scopes, created_at, revoked_at) — never key_hash.")
   (put-blob! [store name content]
     "Write bytes to a fresh content-addressed blob; returns its storage_ref.")
   (get-blob [store ref]
@@ -250,6 +258,11 @@
     (jdbc/fetch-one conn
       ["SELECT * FROM items WHERE name = ? AND (expires_at IS NULL OR expires_at > ?)"
        (names/normalize nm) (iso-utc (Instant/now))]))
+
+  (expired-item? [_ nm]
+    (some? (jdbc/fetch-one conn
+            ["SELECT 1 AS one FROM items WHERE name = ? AND expires_at IS NOT NULL AND expires_at <= ?"
+             (names/normalize nm) (iso-utc (Instant/now))])))
 
   (update-item! [_ nm patch]
     (with-write-tx conn
@@ -330,13 +343,21 @@
                  MAX(created_at) AS newest_created
                FROM items"
                now now])
-          k (jdbc/fetch-one conn ["SELECT COUNT(*) AS api_keys FROM api_keys"])]
+          k (jdbc/fetch-one conn
+              ["SELECT COUNT(*) AS api_keys,
+                      COALESCE(SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END), 0) AS api_keys_active
+               FROM api_keys"])]
       {:items-live (:items_live a)
        :items-expired (:items_expired a)
        :bytes-total (:bytes_total a)
        :api-keys (:api_keys k)
+       :api-keys-active (:api_keys_active k)
        :oldest-created (:oldest_created a)
        :newest-created (:newest_created a)}))
+
+  (migrations-current? [_]
+    (let [applied (set (map :id (jdbc/fetch conn ["SELECT id FROM schema_migrations"])))]
+      (every? #(contains? applied (:id %)) migrations)))
 
   (delete-expired-batch [_ limit]
     (let [now (iso-utc (Instant/now))
@@ -374,6 +395,11 @@
                        ["UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL"
                         revoked-at key-id]))))))
 
+  (list-api-keys [_]
+    (jdbc/fetch conn
+      ["SELECT key_id, label, scopes, created_at, revoked_at
+        FROM api_keys ORDER BY created_at, key_id"]))
+
   (put-blob! [_ nm content]
     (when-not (valid-blob-name? nm)
       (throw (ex-info "invalid blob name" {:name nm})))
@@ -408,6 +434,18 @@
             (file-seq root)))))
 
 ;; --- lifecycle ---------------------------------------------------------------
+
+(defn probe-writable!
+  "Readiness write probe (Q51): create+delete a probe file in the data dir,
+   then a no-op BEGIN IMMEDIATE/ROLLBACK on the connection. Returns true;
+   throws when storage is not writable."
+  [store]
+  (let [f (io/file (:dir store) ".readyz-probe")]
+    (spit f "ok")
+    (.delete f)
+    (jdbc/execute! (:conn store) ["BEGIN IMMEDIATE"])
+    (jdbc/execute! (:conn store) ["ROLLBACK"])
+    true))
 
 (defn open!
   "Open the store rooted at dir (created if absent): applies pending
