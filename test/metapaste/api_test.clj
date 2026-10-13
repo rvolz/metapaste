@@ -461,3 +461,290 @@
               (is (= 1 @calls))))
           (finally (storage/close-storage store))))
       (finally (delete-recursively! dir)))))
+
+;; --- M6: management /manage/v1 (admin token, Q27/Q52) ------------------------
+
+(def admin-token "adm1n-t0ken")
+
+(defn- test-handler
+  "Ring handler over a real store with handler-cfg + overrides."
+  [store cfg-overrides]
+  (api/make-handler {:store store
+                     :config (handler-cfg cfg-overrides)
+                     :multipart-parser (fn [_] nil)}))
+
+(defn- send-as
+  "Ring call with a JSON body and caller headers; returns
+   [status parsed-body-or-nil response-headers]."
+  [handler method uri body headers]
+  (let [raw (.getBytes (json/write-str body :escape-slash false
+                                        :escape-unicode false)
+                       "UTF-8")
+        resp (handler {:request-method method
+                       :uri uri
+                       :headers (merge {"content-type" "application/json"
+                                        "content-length" (str (alength raw))}
+                                       headers)
+                       :body (ByteArrayInputStream. raw)})]
+    [(:status resp)
+     (when-let [b (:body resp)] (json/read-str b :key-fn keyword))
+     (:headers resp)]))
+
+(defn- admin-call [handler method uri]
+  (call handler method uri {"authorization" admin-token}))
+
+(deftest manage-routes-require-admin-token
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token admin-token})
+                cases [[:get "/manage/v1/stats"]
+                       [:post "/manage/v1/cleanup"]
+                       [:get "/manage/v1/keys"]
+                       [:post "/manage/v1/keys"]
+                       [:delete "/manage/v1/keys/aaaaaaaa"]
+                       [:delete "/manage/v1/items/k3v9qx2m4pta"]
+                       [:get "/manage/v1/config"]]]
+            (doseq [[m uri] cases]
+              (testing (str (name m) " " uri " without token -> 401 problem+json")
+                (let [resp (call h m uri)]
+                  (is (= 401 (:status resp)))
+                  (is (= "application/problem+json"
+                         (get-in resp [:headers "Content-Type"])))
+                  (is (= "urn:metapaste:problem:unauthorized"
+                         (:type (json/read-str (:body resp) :key-fn keyword))))))
+              (testing "wrong token -> 401"
+                (is (= 401 (:status (call h m uri {"authorization" "wrong"})))))
+              (testing "Bearer-wrapped wrong token -> 401"
+                (is (= 401 (:status (call h m uri {"authorization" "Bearer wrong"}))))))
+            (testing "health routes stay unauthenticated"
+              (is (= 200 (:status (call h :get "/healthz")))))
+            (testing "admin_token unset in config -> management always 401"
+              (let [h2 (test-handler store {})]
+                (is (= 401 (:status (call h2 :get "/manage/v1/stats"
+                                          {"authorization" "anything"})))))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest manage-admin-token-accepted-raw-or-bearer-wrapped
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token admin-token})]
+            (is (= 200 (:status (admin-call h :get "/manage/v1/stats"))))
+            (is (= 200 (:status (call h :get "/manage/v1/stats"
+                                      {"authorization" (str "Bearer " admin-token)})))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest manage-stats-fields
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token admin-token})
+                bearer {"authorization"
+                        (str "Bearer "
+                             (:secret (auth/create-key! store {:label "owner"
+                                                               :scopes "read,write"})))}
+                [lst live] (send-as h :post "/api/v1/items"
+                                    {:content "live" :mime_type "text/plain"
+                                     :ttl_seconds 3600}
+                                    bearer)
+                [est exp] (send-as h :post "/api/v1/items"
+                                   {:content "gone" :mime_type "text/plain"
+                                    :ttl_seconds 60}
+                                   bearer)]
+            (is (= 201 lst) (pr-str live))
+            (is (= 201 est) (pr-str exp))
+            ;; expired-but-uncollected: backdate past expiry, keep the row
+            (with-db-conn dir
+              (fn [c]
+                (jdbc/execute! c
+                  ["UPDATE items SET expires_at = ? WHERE name = ?"
+                   (storage/iso-utc (.minusSeconds (Instant/now) 60))
+                   (:name exp)])))
+            (auth/create-key! store {:label "second" :scopes "read"})
+            (let [st (admin-call h :get "/manage/v1/stats")
+                  m (json/read-str (:body st) :key-fn keyword)]
+              (is (= 200 (:status st)))
+              (is (= #{:items_live :items_expired :bytes_total
+                       :oldest_created :newest_created :api_keys_active}
+                     (set (keys m)))
+                  (pr-str m))
+              (is (= 1 (:items_live m)))
+              (is (= 1 (:items_expired m)))
+              (is (= 8 (:bytes_total m)))
+              (is (string? (:oldest_created m)))
+              (is (string? (:newest_created m)))
+              (is (= 2 (:api_keys_active m)))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest manage-cleanup-runs-synchronously
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token admin-token})
+                bearer {"authorization"
+                        (str "Bearer "
+                             (:secret (auth/create-key! store {:label "owner"
+                                                               :scopes "read,write"})))}
+                [_ exp] (send-as h :post "/api/v1/items"
+                                 {:content "bye" :mime_type "text/plain"
+                                  :ttl_seconds 60}
+                                 bearer)]
+            (with-db-conn dir
+              (fn [c]
+                (jdbc/execute! c
+                  ["UPDATE items SET expires_at = ? WHERE name = ?"
+                   (storage/iso-utc (.minusSeconds (Instant/now) 60))
+                   (:name exp)])))
+            (let [st (admin-call h :post "/manage/v1/cleanup")
+                  m (json/read-str (:body st) :key-fn keyword)]
+              (is (= 200 (:status st)) (pr-str st))
+              (is (= 1 (:deleted m)))
+              (is (= 0 (:orphans m)))
+              (is (int? (:duration-ms m)))
+              (is (nil? (storage/get-item store (:name exp))))
+              (testing "second pass finds nothing"
+                (let [st2 (admin-call h :post "/manage/v1/cleanup")
+                      m2 (json/read-str (:body st2) :key-fn keyword)]
+                  (is (= 200 (:status st2)))
+                  (is (= 0 (:deleted m2))))))))
+        (storage/close-storage store))
+      (finally (delete-recursively! dir)))))
+
+(deftest manage-keys-crud-secret-once
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token admin-token})
+                [st m] (send-as h :post "/manage/v1/keys"
+                                {:label "first" :scopes "read,write"}
+                                {"authorization" admin-token})]
+            (is (= 201 st) (pr-str m))
+            (testing "create response carries the plaintext secret exactly once"
+              (is (re-matches #"mp_[A-Za-z0-9]{8}_[A-Za-z0-9_-]{43}"
+                              (str (:secret m))))
+              (is (string? (:key_id m)))
+              (is (= "first" (:label m)))
+              (is (= "read,write" (:scopes m)))
+              (is (string? (:created_at m))))
+            (testing "the secret authenticates real traffic"
+              (let [[ist _] (send-as h :post "/api/v1/items"
+                                     {:content "t" :mime_type "text/plain"}
+                                     {"authorization" (str "Bearer " (:secret m))})]
+                (is (= 201 ist))))
+            (testing "listing returns exactly the public fields, no secrets"
+              (let [st2 (admin-call h :get "/manage/v1/keys")
+                    entries (:keys (json/read-str (:body st2) :key-fn keyword))]
+                (is (= 200 (:status st2)))
+                (is (= 1 (count entries)))
+                (is (= #{:key_id :label :scopes :created_at :revoked_at}
+                       (set (keys (first entries))))
+                    (pr-str (first entries)))
+                (is (= (:key_id m) (:key_id (first entries))))
+                (is (nil? (:revoked_at (first entries))))))
+            (testing "revoke: 204 once, then 404; unknown key 404"
+              (is (= 204 (:status (call h :delete
+                                        (str "/manage/v1/keys/" (:key_id m))
+                                        {"authorization" admin-token}))))
+              (is (= 404 (:status (call h :delete
+                                        (str "/manage/v1/keys/" (:key_id m))
+                                        {"authorization" admin-token}))))
+              (is (= 404 (:status (call h :delete "/manage/v1/keys/zzzzzzzz"
+                                        {"authorization" admin-token}))))
+              (testing "revoked key no longer authenticates"
+                (let [[st3 _] (send-as h :post "/api/v1/items"
+                                       {:content "x" :mime_type "text/plain"}
+                                       {"authorization" (str "Bearer " (:secret m))})]
+                  (is (= 401 st3)))))
+            (testing "revoked_at shows up in the listing"
+              (let [st4 (admin-call h :get "/manage/v1/keys")
+                    entries (:keys (json/read-str (:body st4) :key-fn keyword))]
+                (is (string? (:revoked_at (first entries))))))
+            (testing "a second create returns a different secret"
+              (let [[st5 m5] (send-as h :post "/manage/v1/keys"
+                                      {:label "second"}
+                                      {"authorization" admin-token})]
+                (is (= 201 st5))
+                (is (not= (:secret m) (:secret m5)))))
+            (testing "validation: blank/absent label, bad scopes, non-object body"
+              (is (= 400 (first (send-as h :post "/manage/v1/keys" {}
+                                         {"authorization" admin-token}))))
+              (is (= 400 (first (send-as h :post "/manage/v1/keys"
+                                         {:label "x" :scopes "admin"}
+                                         {"authorization" admin-token}))))
+              (is (= 400 (first (send-as h :post "/manage/v1/keys" [1 2]
+                                         {"authorization" admin-token}))))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest manage-purge-bypasses-ownership
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token admin-token})
+                k1 (:secret (auth/create-key! store {:label "owner"
+                                                     :scopes "read,write"}))
+                k2 (:secret (auth/create-key! store {:label "other"
+                                                     :scopes "read,write"}))
+                [st item] (send-as h :post "/api/v1/items"
+                                   {:content "mine" :mime_type "text/plain"}
+                                   {"authorization" (str "Bearer " k1)})]
+            (is (= 201 st) (pr-str item))
+            (testing "ownership still applies on the item API (403 for k2)"
+              (is (= 403 (:status (call h :delete
+                                        (str "/api/v1/items/" (:name item))
+                                        {"authorization" (str "Bearer " k2)})))))
+            (testing "admin purge of the item works (no owner key involved)"
+              (is (= 204 (:status (admin-call h :delete
+                                              (str "/manage/v1/items/"
+                                                   (:name item))))))
+              (is (= 404 (:status (call h :get
+                                        (str "/api/v1/items/" (:name item))
+                                        {"authorization" (str "Bearer " k1)})))))
+            (testing "unknown name -> 404"
+              (is (= 404 (:status (admin-call h :delete
+                                              "/manage/v1/items/kkkkkkkkkkkk")))))
+            (testing "expired-but-uncollected item -> 404 (404s for unknown/expired)"
+              (let [[st2 exp] (send-as h :post "/api/v1/items"
+                                       {:content "old" :mime_type "text/plain"
+                                        :ttl_seconds 60}
+                                       {"authorization" (str "Bearer " k1)})]
+                (is (= 201 st2))
+                (with-db-conn dir
+                  (fn [c]
+                    (jdbc/execute! c
+                      ["UPDATE items SET expires_at = ? WHERE name = ?"
+                       (storage/iso-utc (.minusSeconds (Instant/now) 60))
+                       (:name exp)])))
+                (is (= 404 (:status (admin-call h :delete
+                                                (str "/manage/v1/items/"
+                                                     (:name exp)))))))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
+
+(deftest manage-config-redacted
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [h (test-handler store {:admin_token "sekrit-admin-tok"})
+                st (call h :get "/manage/v1/config"
+                         {"authorization" "sekrit-admin-tok"})
+                m (json/read-str (:body st) :key-fn keyword)]
+            (is (= 200 (:status st)))
+            (is (= "***REDACTED***" (:admin_token m)))
+            (is (= "***REDACTED***" (:dev_api_key m)))
+            (is (= 8080 (:port m)))
+            (is (not (re-find #"sekrit-admin-tok" (pr-str m)))
+                "no secret value anywhere in the config response"))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))
