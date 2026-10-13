@@ -29,6 +29,19 @@
     (is (= "mp_dev_devkey" (:dev_api_key cfg)))
     (is (= 3600 (:cleanup_interval_s cfg)))))
 
+(deftest metrics-port-key
+  (testing "default is main port + 1"
+    (is (= 8081 (:metrics_port (config/load-config {:env {}}))))
+    (is (= 9001 (:metrics_port (config/load-config
+                                 {:env {"METAPASTE_PORT" "9000"}})))))
+  (testing "env override wins"
+    (is (= 9100 (:metrics_port (config/load-config
+                                 {:env {"METAPASTE_PORT" "9000"
+                                        "METAPASTE_METRICS_PORT" "9100"}})))))
+  (testing "out-of-range values are rejected"
+    (is (thrown? Exception
+                 (config/load-config {:env {"METAPASTE_METRICS_PORT" "70000"}})))))
+
 (deftest precedence-env-over-file-over-default
   (with-config-file
     "precedence.edn"

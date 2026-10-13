@@ -32,7 +32,8 @@
    :port :int
    :path_prefix :string
    :dev_api_key :string
-   :cleanup_interval_s :int})
+   :cleanup_interval_s :int
+   :metrics_port :int})
 
 (def ^:private env-prefix "METAPASTE_")
 
@@ -149,6 +150,8 @@
       (fail (str "rate_limit_burst must be at least 1, got " (:rate_limit_burst cfg))))
     (when (or (< (:port cfg) 0) (> (:port cfg) 65535))
       (fail (str "port " (:port cfg) " is outside 0-65535")))
+    (when (or (< (:metrics_port cfg) 0) (> (:metrics_port cfg) 65535))
+      (fail (str "metrics_port " (:metrics_port cfg) " is outside 0-65535")))
     (let [p (:path_prefix cfg)]
       (when-not (or (= "" p)
                     (and (str/starts-with? p "/") (not (str/ends-with? p "/"))))
@@ -175,9 +178,13 @@
    (let [file-data (read-config-file config-file)
          fl (file-layer file-data (or config-file "(config file)"))
          el (env-layer (or env {}))
-         merged (-> defaults
-                    (merge (:values fl))
-                    (merge (:values el)))
+         base (-> defaults
+                  (merge (:values fl))
+                  (merge (:values el)))
+         ;; metrics listener default: main port + 1 (Q46), explicit key wins
+         merged (if (contains? base :metrics_port)
+                  base
+                  (assoc base :metrics_port (inc (long (:port base)))))
          cfg (validate! merged)
          warnings (vec (concat (:warnings fl) (:warnings el)))]
      (cond-> cfg
