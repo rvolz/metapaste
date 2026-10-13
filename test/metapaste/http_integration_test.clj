@@ -486,8 +486,8 @@
     (let [r (call :put "/api/v1/items")]
       (is (problem? r 405 "method-not-allowed"))
       (is (= "GET, POST" (get-in r [:headers "allow"])))))
-  (testing "404 for unknown paths (healthz/readyz/metrics/manage are M6, unimplemented)"
-    (is (= 404 (:status (call :get "/healthz" {:no-auth true}))))
+  (testing "healthz is public (Q51); unknown paths still 404"
+    (is (= 200 (:status (call :get "/healthz" {:no-auth true}))))
     (is (= 404 (:status (call :get "/api/v1/nope"))))))
 
 (deftest request-id-echo-and-generation
