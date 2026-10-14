@@ -13,6 +13,7 @@
   (:require [ring-chez.adapter :as adapter]
             [ring-chez.multipart.core :as multipart]
             [metapaste.api :as api]
+            [metapaste.cleanup :as cleanup]
             [metapaste.config :as config]
             [metapaste.log :as log]
             [metapaste.storage :as storage]))
@@ -68,9 +69,11 @@
 
 (defn stop-server!
   "Stop a handle returned by start-server!: stop accepting, drain in-flight
-   requests, close live connections."
-  [handle]
-  (adapter/stop-server handle))
+   requests, close live connections. opts pass through to the adapter — the
+   shutdown path uses {:drain-timeout-ms 10000} as its bounded drain."
+  ([handle] (stop-server! handle nil))
+  ([handle opts]
+   (adapter/stop-server handle opts)))
 
 (defn start-metrics-server!
   "Start the INTERNAL metrics listener (Q46/Q47): GET /metrics on :metrics_port
@@ -85,18 +88,57 @@
                         ;; scrapes carry no body; cap is transport hygiene only
                         :max-request-bytes 65536})))
 
+(defn shutdown-hook!
+  "Graceful shutdown (spec section 14 risk 7): stop every listener with the
+   bounded drain, stop the cleanup worker, close storage, then exit 0.
+   serve! registers the returned 0-arg fn with the runtime; it runs at most
+   once. listeners are 0-arg stop fns, cleanup-stop! stops the worker
+   (cleanup/stop!), exit-fn defaults to System/exit — probes showed jolt
+   exits 143 after a hook returns, so the hook must exit 0 itself."
+  [{:keys [store listeners cleanup-stop! exit-fn]}]
+  (let [ran? (atom false)
+        exit! (or exit-fn (fn [code] (System/exit code)))]
+    (fn []
+      (when (compare-and-set! ran? false true)
+        (log/info "shutting down")
+        (doseq [stop listeners]
+          (try (stop)
+               (catch Throwable t
+                 (log/warn "listener stop failed" {:error (ex-message t)}))))
+        (try
+          (cleanup-stop!)
+          (log/info "cleanup worker stopped")
+          (catch Throwable t
+            (log/warn "cleanup stop failed" {:error (ex-message t)})))
+        (try (storage/close-storage store)
+             (catch Throwable t
+               (log/warn "storage close failed" {:error (ex-message t)})))
+        (exit! 0)))))
+
 (defn serve!
   "CLI `metapaste serve`: load config, open storage at :data_dir, start the
-   adapter on :port plus the internal metrics listener on :metrics_port, log a
-   startup line, block forever (a jolt thread does not keep the process alive
-   after main returns — serve must own its lifetime)."
+   adapter on :port plus the internal metrics listener on :metrics_port, start
+   the cleanup worker, register the graceful-shutdown hook, log a startup
+   line, block forever (a jolt thread does not keep the process alive after
+   main returns — serve must own its lifetime). On SIGTERM the hook drains
+   both listeners (10 s bound), stops the worker, closes storage, exits 0."
   []
   (let [cfg (config/load-config)]
     (doseq [w (:warnings cfg)]
       (log/warn w))
     (let [store (storage/open! (:data_dir cfg))
           handle (start-server! store cfg)
-          metrics-handle (start-metrics-server! cfg)]
+          metrics-handle (start-metrics-server! cfg)
+          _ (cleanup/start! store {:interval-s (:cleanup_interval_s cfg)})
+          hook (shutdown-hook!
+                 {:store store
+                  :listeners [(fn [] (stop-server! handle {:drain-timeout-ms 10000}))
+                              (fn [] (stop-server! metrics-handle {:drain-timeout-ms 10000}))]
+                  :cleanup-stop! cleanup/stop!})]
+      ;; registered BEFORE the startup line: a SIGTERM arriving the moment
+      ;; the port is observable must find the hook, not the default kill
+      (.addShutdownHook (Runtime/getRuntime)
+                        (Thread. ^Runnable hook "metapaste-shutdown"))
       (log/info "metapaste serving" {:port (:port handle)
                                      :metrics_port (:port metrics-handle)
                                      :path_prefix (:path_prefix cfg)
