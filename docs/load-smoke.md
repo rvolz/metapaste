@@ -63,7 +63,7 @@ it is now warmed at namespace load. Both have regression coverage —
 ## Reproduce
 
 ```sh
-./scripts/build.sh                 # or: SKIP_BUILD=1 for an existing binary
+./scripts/build.sh                 # or point BINARY= at an existing binary
 ./scripts/load-smoke.sh            # 60 s, target 100 req/s, 4 workers
 ./scripts/load-smoke.sh 30 200 8   # 30 s at a 200 req/s target
 ```
