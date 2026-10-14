@@ -66,6 +66,25 @@
 
 (use-fixtures :once once-fixture)
 
+;; --- M7 packaging: bind_host drives the listener address ---------------------
+
+(deftest bind-host-config-drives-listener
+  ;; no explicit :host opt => start-server! takes the address from cfg; this is
+  ;; what METAPASTE_BIND_HOST=0.0.0.0 exercises in the container image.
+  (let [dir (temp-dir)
+        store (storage/open! dir)]
+    (try
+      (let [cfg (assoc (config/load-config {:env {}})
+                       :port 0
+                       :bind_host "0.0.0.0")
+            handle (mhttp/start-server! store cfg)]
+        (try
+          (is (= "0.0.0.0" (:host handle)))
+          (finally (mhttp/stop-server! handle))))
+      (finally
+        (storage/close-storage store)
+        (delete-recursively! dir)))))
+
 ;; --- request helpers ---------------------------------------------------------
 
 (defn- call

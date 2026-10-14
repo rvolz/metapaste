@@ -59,7 +59,9 @@
                     :multipart-parser (make-multipart-parser (:max_item_bytes cfg))})]
      (adapter/run-server handler
                           {:port (if (nil? port) (:port cfg) port)
-                           :host (or host "127.0.0.1")
+                           ;; bind_host (Q54 packaging): 127.0.0.1 by default,
+                           ;; 0.0.0.0 behind a container port publish
+                           :host (or host (:bind_host cfg) "127.0.0.1")
                            ;; explicit: never :fibers on this stack (see ns docstring)
                            :strategy :threads
                            ;; transport cap = request cap + 64 KiB so our
@@ -83,7 +85,7 @@
   ([cfg {:keys [port host]}]
    (adapter/run-server api/metrics-handler
                        {:port (if (nil? port) (:metrics_port cfg) port)
-                        :host (or host "127.0.0.1")
+                        :host (or host (:bind_host cfg) "127.0.0.1")
                         :strategy :threads
                         ;; scrapes carry no body; cap is transport hygiene only
                         :max-request-bytes 65536})))

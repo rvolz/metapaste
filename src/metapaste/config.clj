@@ -15,6 +15,7 @@
    :data_dir "./data"
    :admin_token nil
    :port 8080
+   :bind_host "127.0.0.1"
    :path_prefix ""
    :dev_api_key "mp_dev_devkey"
    :cleanup_interval_s 3600
@@ -31,6 +32,7 @@
    :data_dir :string
    :admin_token :string
    :port :int
+   :bind_host :string
    :path_prefix :string
    :dev_api_key :string
    :cleanup_interval_s :int
@@ -166,6 +168,9 @@
       (fail (str "port " (:port cfg) " is outside 0-65535")))
     (when (or (< (:metrics_port cfg) 0) (> (:metrics_port cfg) 65535))
       (fail (str "metrics_port " (:metrics_port cfg) " is outside 0-65535")))
+    (when (str/blank? (:bind_host cfg))
+      (fail (str "bind_host " (pr-str (:bind_host cfg))
+                 " must be a non-empty IP address or hostname (e.g. 127.0.0.1, 0.0.0.0)")))
     (let [p (:path_prefix cfg)]
       (when-not (or (= "" p)
                     (and (str/starts-with? p "/") (not (str/ends-with? p "/"))))

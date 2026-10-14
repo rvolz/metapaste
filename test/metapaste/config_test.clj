@@ -74,6 +74,17 @@
         (is (thrown-with-msg? Exception #"cors_allow_origins"
               (config/load-config {:env {} :config-file path})))))))
 
+(deftest bind-host-key
+  (testing "default binds loopback only"
+    (is (= "127.0.0.1" (:bind_host (config/load-config {:env {}})))))
+  (testing "env override (container deployments bind the container interface)"
+    (is (= "0.0.0.0" (:bind_host
+                      (config/load-config
+                       {:env {"METAPASTE_BIND_HOST" "0.0.0.0"}})))))
+  (testing "blank value is rejected"
+    (is (thrown-with-msg? Exception #"bind_host"
+          (config/load-config {:env {"METAPASTE_BIND_HOST" "  "}})))))
+
 (deftest precedence-env-over-file-over-default
   (with-config-file
     "precedence.edn"
