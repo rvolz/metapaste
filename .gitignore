@@ -1,6 +1,7 @@
 # build output
 /metapaste
 metapaste.build/
+target/
 
 # agent session state
 .dirge/
