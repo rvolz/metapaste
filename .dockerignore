@@ -1,0 +1,10 @@
+.git
+.dirge
+target/
+metapaste
+metapaste.build/
+data/
+docs/
+test/
+scripts/
+*.md

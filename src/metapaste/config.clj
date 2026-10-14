@@ -15,9 +15,11 @@
    :data_dir "./data"
    :admin_token nil
    :port 8080
+   :bind_host "127.0.0.1"
    :path_prefix ""
    :dev_api_key "mp_dev_devkey"
-   :cleanup_interval_s 3600})
+   :cleanup_interval_s 3600
+   :cors_allow_origins []})
 
 (def ^:private schema
   {:default_ttl_seconds :int
@@ -30,10 +32,12 @@
    :data_dir :string
    :admin_token :string
    :port :int
+   :bind_host :string
    :path_prefix :string
    :dev_api_key :string
    :cleanup_interval_s :int
-   :metrics_port :int})
+   :metrics_port :int
+   :cors_allow_origins :list})
 
 (def ^:private env-prefix "METAPASTE_")
 
@@ -75,9 +79,21 @@
                       :else (fail (str (name k) "=" (pr-str raw) " is not a boolean (expected true/false/yes/no)"))))
     :else (fail (str (name k) "=" (pr-str raw) " is not a boolean (expected true/false/yes/no)"))))
 
+(defn- coerce-list [k raw]
+  (cond
+    (nil? raw) nil
+    (string? raw) (->> (str/split raw #",")
+                       (map str/trim)
+                       (remove str/blank?)
+                       vec)
+    (and (sequential? raw) (every? string? raw)) (vec raw)
+    :else (fail (str (name k) "=" (pr-str raw)
+                     " is not a list (expected a vector of strings or a comma-separated string)"))))
+
 (defn- coerce-value [k type raw]
-  (if (= type :bool)
-    (coerce-bool k raw)
+  (case type
+    :bool (coerce-bool k raw)
+    :list (coerce-list k raw)
     (coerce k type raw)))
 
 (defn- read-config-file
@@ -152,11 +168,19 @@
       (fail (str "port " (:port cfg) " is outside 0-65535")))
     (when (or (< (:metrics_port cfg) 0) (> (:metrics_port cfg) 65535))
       (fail (str "metrics_port " (:metrics_port cfg) " is outside 0-65535")))
+    (when (str/blank? (:bind_host cfg))
+      (fail (str "bind_host " (pr-str (:bind_host cfg))
+                 " must be a non-empty IP address or hostname (e.g. 127.0.0.1, 0.0.0.0)")))
     (let [p (:path_prefix cfg)]
       (when-not (or (= "" p)
                     (and (str/starts-with? p "/") (not (str/ends-with? p "/"))))
         (fail (str "path_prefix " (pr-str p)
                    " must be empty or start with \"/\" and not end with \"/\""))))
+    (doseq [o (:cors_allow_origins cfg)]
+      (when-not (re-matches #"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s]+" o)
+        (fail (str "cors_allow_origins entry " (pr-str o)
+                   " is not an origin (expected scheme://host[:port], no path;"
+                   " wildcards are not supported)"))))
     cfg))
 
 (defn- resolve-config-file

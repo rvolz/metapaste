@@ -10,6 +10,13 @@
            [java.security MessageDigest]
            [java.time Instant]))
 
+;; Resolve java.security.MessageDigest ONCE on the loading thread: the
+;; jolt-crypto dep provides it lazily (RFC 0014), and concurrent first
+;; touches made the losing threads throw "Unknown class MessageDigest" —
+;; create requests 500'd under parallel load. Same fix as metapaste.log's
+;; Instant warmup.
+(defonce ^:private md-warmup (MessageDigest/getInstance "SHA-256"))
+
 ;; --- timestamps --------------------------------------------------------------
 
 (defn iso-utc
@@ -121,25 +128,39 @@
 (defn- with-write-tx
   "Run f inside BEGIN IMMEDIATE ... COMMIT (rollback on any throw). The driver
    has no SQLITE_BUSY retry of its own beyond busy_timeout, so busy failures
-   are retried a small, bounded number of times at this level."
+   are retried a small, bounded number of times at this level. The connection
+   lock is held for the WHOLE window: jolt-lang/db passes statements straight
+   to SQLite, and a second thread's BEGIN landing inside someone else's
+   transaction fails with 'cannot start a transaction within a transaction'
+   (found by the M7 load smoke under 4-way parallel creates)."
   [conn f]
-  (loop [retries write-retries]
-    (let [outcome (try
-                    (jdbc/execute! conn ["BEGIN IMMEDIATE"])
-                    (try
-                      (let [v (f)]
-                        (jdbc/execute! conn ["COMMIT"])
-                        [:done v])
+  (locking conn
+    (loop [retries write-retries]
+      (let [outcome (try
+                      (jdbc/execute! conn ["BEGIN IMMEDIATE"])
+                      (try
+                        (let [v (f)]
+                          (jdbc/execute! conn ["COMMIT"])
+                          [:done v])
+                        (catch Throwable t
+                          (try (jdbc/execute! conn ["ROLLBACK"]) (catch Throwable _ nil))
+                          (throw t)))
                       (catch Throwable t
-                        (try (jdbc/execute! conn ["ROLLBACK"]) (catch Throwable _ nil))
-                        (throw t)))
-                    (catch Throwable t
-                      (if (and (busy? t) (pos? retries))
-                        [:retry]
-                        (throw t))))]
-      (if (= :retry (first outcome))
-        (recur (dec retries))
-        (second outcome)))))
+                        (if (and (busy? t) (pos? retries))
+                          [:retry]
+                          (throw t))))]
+        (if (= :retry (first outcome))
+          (recur (dec retries))
+          (second outcome))))))
+
+;; Every statement on the store's single shared connection goes through these:
+;; java.sql connections are not thread-safe, and reads must not interleave
+;; with an open write transaction on the same connection either.
+(defn- exec! [conn stmt] (locking conn (jdbc/execute! conn stmt)))
+
+(defn- q1 [conn stmt] (locking conn (jdbc/fetch-one conn stmt)))
+
+(defn- q [conn stmt] (locking conn (jdbc/fetch conn stmt)))
 
 ;; --- migrations (Q44): numbered, embedded, forward-only ----------------------
 
@@ -255,14 +276,14 @@
                 (unregister-blob-ref! ref))))))))
 
   (get-item [_ nm]
-    (jdbc/fetch-one conn
-      ["SELECT * FROM items WHERE name = ? AND (expires_at IS NULL OR expires_at > ?)"
-       (names/normalize nm) (iso-utc (Instant/now))]))
+    (q1 conn
+        ["SELECT * FROM items WHERE name = ? AND (expires_at IS NULL OR expires_at > ?)"
+         (names/normalize nm) (iso-utc (Instant/now))]))
 
   (expired-item? [_ nm]
-    (some? (jdbc/fetch-one conn
-            ["SELECT 1 AS one FROM items WHERE name = ? AND expires_at IS NOT NULL AND expires_at <= ?"
-             (names/normalize nm) (iso-utc (Instant/now))])))
+    (some? (q1 conn
+               ["SELECT 1 AS one FROM items WHERE name = ? AND expires_at IS NOT NULL AND expires_at <= ?"
+                (names/normalize nm) (iso-utc (Instant/now))])))
 
   (update-item! [_ nm patch]
     (with-write-tx conn
@@ -330,11 +351,11 @@
                    (when (:limit opts) " LIMIT ?"))
           params (cond-> params
                    (:limit opts) (conj (long (:limit opts))))]
-      (jdbc/fetch conn (into [sql] params))))
+      (q conn (into [sql] params))))
 
   (stats [_]
     (let [now (iso-utc (Instant/now))
-          a (jdbc/fetch-one conn
+          a (q1 conn
               ["SELECT
                  COALESCE(SUM(CASE WHEN expires_at IS NULL OR expires_at > ? THEN 1 ELSE 0 END), 0) AS items_live,
                  COALESCE(SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END), 0) AS items_expired,
@@ -343,8 +364,8 @@
                  MAX(created_at) AS newest_created
                FROM items"
                now now])
-          k (jdbc/fetch-one conn
-              ["SELECT COUNT(*) AS api_keys,
+          k (q1 conn
+                ["SELECT COUNT(*) AS api_keys,
                       COALESCE(SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END), 0) AS api_keys_active
                FROM api_keys"])]
       {:items-live (:items_live a)
@@ -356,7 +377,7 @@
        :newest-created (:newest_created a)}))
 
   (migrations-current? [_]
-    (let [applied (set (map :id (jdbc/fetch conn ["SELECT id FROM schema_migrations"])))]
+    (let [applied (set (map :id (q conn ["SELECT id FROM schema_migrations"])))]
       (every? #(contains? applied (:id %)) migrations)))
 
   (delete-expired-batch [_ limit]
@@ -386,7 +407,7 @@
         (jdbc/fetch-one conn ["SELECT * FROM api_keys WHERE key_id = ?" (:key_id row)]))))
 
   (get-api-key [_ key-id]
-    (jdbc/fetch-one conn ["SELECT * FROM api_keys WHERE key_id = ?" key-id]))
+    (q1 conn ["SELECT * FROM api_keys WHERE key_id = ?" key-id]))
 
   (revoke-api-key! [_ key-id revoked-at]
     (with-write-tx conn
@@ -396,9 +417,9 @@
                         revoked-at key-id]))))))
 
   (list-api-keys [_]
-    (jdbc/fetch conn
-      ["SELECT key_id, label, scopes, created_at, revoked_at
-        FROM api_keys ORDER BY created_at, key_id"]))
+    (q conn
+       ["SELECT key_id, label, scopes, created_at, revoked_at
+         FROM api_keys ORDER BY created_at, key_id"]))
 
   (put-blob! [_ nm content]
     (when-not (valid-blob-name? nm)
@@ -419,7 +440,7 @@
     true)
 
   (blob-referenced? [_ ref]
-    (some? (jdbc/fetch-one conn ["SELECT 1 AS hit FROM items WHERE storage_ref = ? LIMIT 1" ref])))
+    (some? (q1 conn ["SELECT 1 AS hit FROM items WHERE storage_ref = ? LIMIT 1" ref])))
 
   (list-blob-files [_]
     (let [root (io/file dir "blobs")
@@ -443,8 +464,11 @@
   (let [f (io/file (:dir store) ".readyz-probe")]
     (spit f "ok")
     (.delete f)
-    (jdbc/execute! (:conn store) ["BEGIN IMMEDIATE"])
-    (jdbc/execute! (:conn store) ["ROLLBACK"])
+    ;; one lock hold for BEGIN..ROLLBACK: an interleaved writer's BEGIN would
+    ;; land inside the probe transaction (see with-write-tx)
+    (locking (:conn store)
+      (jdbc/execute! (:conn store) ["BEGIN IMMEDIATE"])
+      (jdbc/execute! (:conn store) ["ROLLBACK"]))
     true))
 
 (defn open!
