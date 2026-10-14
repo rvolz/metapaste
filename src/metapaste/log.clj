@@ -2,6 +2,14 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]))
 
+;; Resolve java.time.Instant ONCE, on the loading thread, before serve! spawns
+;; anything: jolt registers the io.github.jolt-lang/time provider lazily on
+;; first class lookup, and two threads first-touching Instant concurrently made
+;; the loser throw "No dependency provides java.time.Instant" (RFC 0014) —
+;; the main thread lost => exit 1 before the startup line. Log lines are the
+;; earliest Instant use in the app, so warming it here covers startup.
+(defonce ^:private instant-warmup (java.time.Instant/now))
+
 (def ^:dynamic *request-id* nil)
 
 (def ^:private secret-key-re #"(?i)token|secret|password")

@@ -83,7 +83,8 @@
             proc (.start pb)]
         (try
           ;; wait for the serve line on stdout (worker + hook installed by then)
-          (let [deadline (+ (System/currentTimeMillis) 30000)]
+          ;; this box takes ~24 s to print the startup line; 60 s leaves room
+          (let [deadline (+ (System/currentTimeMillis) 60000)]
             (loop []
               (cond
                 (str/includes? (try (slurp out) (catch Exception _ ""))
