@@ -10,6 +10,7 @@
             [metapaste.auth :as auth]
             [metapaste.cleanup :as cleanup]
             [metapaste.config :as config]
+            [metapaste.cors :as cors]
             [metapaste.log :as log]
             [metapaste.metrics :as metrics]
             [metapaste.names :as names]
@@ -845,28 +846,36 @@
             request (assoc request
                            :path-params (:path-params match)
                            :route route)]
-        (if-let [handler (get data method)]
-          (case (:kind data)
-            :public
-            [(call-handler ctx request handler) nil route]
+         (if (and (= :options method)
+                  (cors/preflight? request)
+                  (cors/allowed? (:config ctx) request))
+           ;; Q55 preflight: answered only for allowlisted origins; anything
+           ;; else falls through to the 405 below (no CORS headers)
+           [(cors/preflight-response (get-in request [:headers "origin"])
+                                     (allow-header data))
+            nil route]
+           (if-let [handler (get data method)]
+             (case (:kind data)
+               :public
+               [(call-handler ctx request handler) nil route]
 
-            :manage
-            (if (accepted-key ctx request)
-              [(call-handler ctx (assoc request :admin true) handler) nil route]
-              [(problem 401 "unauthorized" "admin token required") nil route])
+               :manage
+               (if (accepted-key ctx request)
+                 [(call-handler ctx (assoc request :admin true) handler) nil route]
+                 [(problem 401 "unauthorized" "admin token required") nil route])
 
-            (let [authz (authorize ctx request method)]
-              (if-let [resp (:response authz)]
-                [resp (:key-id authz) route]
-                (let [req (:request authz)
-                      forbidden (ownership-gate ctx req)]
-                  (if forbidden
-                    [forbidden (:key-id authz) route]
-                    [(call-handler ctx req handler) (:key-id authz) route])))))
-          [(problem 405 "method-not-allowed"
-                    (str (str/upper-case (name method)) " not allowed on this path")
-                    {"Allow" (allow-header data)})
-           nil route]))
+               (let [authz (authorize ctx request method)]
+                 (if-let [resp (:response authz)]
+                   [resp (:key-id authz) route]
+                   (let [req (:request authz)
+                         forbidden (ownership-gate ctx req)]
+                     (if forbidden
+                       [forbidden (:key-id authz) route]
+                       [(call-handler ctx req handler) (:key-id authz) route])))))
+             [(problem 405 "method-not-allowed"
+                       (str (str/upper-case (name method)) " not allowed on this path")
+                       {"Allow" (allow-header data)})
+              nil route])))
       [(problem 404 "not-found" (str "no route for " (:uri request))) nil nil])))
 
 (defn make-handler
@@ -887,7 +896,8 @@
                 fields (::log-fields resp*)
                 resp (-> resp*
                          (dissoc ::log-fields)
-                         (assoc-in [:headers "X-Request-Id"] rid))]
+                         (assoc-in [:headers "X-Request-Id"] rid)
+                         (cors/attach (:config ctx) request))]
             ;; every dispatch outcome is counted (Q47), from the final status
             (record-http! route (:request-method request) (:status resp) t0)
             (record-side-effects! request route resp*)

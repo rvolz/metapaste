@@ -42,6 +42,38 @@
     (is (thrown? Exception
                  (config/load-config {:env {"METAPASTE_METRICS_PORT" "70000"}})))))
 
+(deftest cors-allowlist-key
+  (testing "default is an empty list (CORS disabled)"
+    (is (= [] (:cors_allow_origins (config/load-config {:env {}})))))
+  (testing "env value is a comma-separated list, trimmed, blanks dropped"
+    (is (= ["https://a.example" "https://b.example"]
+           (:cors_allow_origins
+            (config/load-config
+             {:env {"METAPASTE_CORS_ALLOW_ORIGINS"
+                    " https://a.example , https://b.example , "}})))))
+  (testing "empty env value keeps CORS disabled"
+    (is (= [] (:cors_allow_origins
+               (config/load-config
+                {:env {"METAPASTE_CORS_ALLOW_ORIGINS" ""}})))))
+  (testing "config file value is a vector of origins"
+    (with-config-file
+      "cors.edn" "{:cors_allow_origins [\"https://a.example\" \"http://localhost:3000\"]}"
+      (fn [path]
+        (is (= ["https://a.example" "http://localhost:3000"]
+               (:cors_allow_origins
+                (config/load-config {:env {} :config-file path})))))))
+  (testing "entries must be origins (scheme://host[:port], no path, no wildcard)"
+    (doseq [bad ["app.example" "https://x.example/path" "*"]]
+      (is (thrown-with-msg? Exception #"cors_allow_origins"
+            (config/load-config
+             {:env {"METAPASTE_CORS_ALLOW_ORIGINS" bad}}))
+          (str "rejects " (pr-str bad)))))
+  (testing "non-list value in the config file is rejected"
+    (with-config-file "cors-bad.edn" "{:cors_allow_origins 5}"
+      (fn [path]
+        (is (thrown-with-msg? Exception #"cors_allow_origins"
+              (config/load-config {:env {} :config-file path})))))))
+
 (deftest precedence-env-over-file-over-default
   (with-config-file
     "precedence.edn"
