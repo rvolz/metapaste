@@ -471,3 +471,30 @@
                                                        :mime-prefix "application/"})))))
         (storage/close-storage store))
       (finally (delete-recursively! dir)))))
+
+(deftest concurrent-writes-and-reads-on-one-store
+  ;; M7 (load-smoke finding): the store shares ONE sqlite connection across
+  ;; every request thread. Statements serialize on the connection lock and
+  ;; with-write-tx holds it across BEGIN..COMMIT; before that, parallel
+  ;; creates failed ~20% of the time with "cannot start a transaction
+  ;; within a transaction". Also exercises MessageDigest first-touch, which
+  ;; must not race (storage warms it at load).
+  (with-store [store dir]
+    (let [errs (atom [])
+          workers (doall
+                    (for [w (range 4)]
+                      (future
+                        (dotimes [i 30]
+                          (try
+                            (let [row (storage/create-item!
+                                        store {:content (.getBytes (str "c" w "-" i))
+                                               :mime_type "text/plain"
+                                               :ttl_seconds 259200
+                                               :owner_key_id "k1"})]
+                              (storage/get-item store (:name row))
+                              (storage/list-items store {:limit 5}))
+                            (catch Throwable t
+                              (swap! errs conj (str (class t) ": " (ex-message t)))))))))]
+      (doseq [f workers] (deref f))
+      (is (= [] @errs))
+      (is (= 120 (count (storage/list-items store {:include-expired? false})))))))
