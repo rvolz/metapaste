@@ -6,6 +6,7 @@
   multipart parsing seam live in metapaste.http; this namespace receives the
   parser as a function in its context map."
   (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [metapaste.auth :as auth]
             [metapaste.cleanup :as cleanup]
@@ -698,6 +699,26 @@
     (problem 503 "not-ready" detail)
     (json-response 200 {:status "ok"})))
 
+;; --- OpenAPI document (served spec) ------------------------------------------
+;; resources/openapi.json is docs/openapi.yaml (FROZEN) converted by
+;; scripts/gen-openapi-json.py and baked into the binary via :jolt/build
+;; {:embed ["resources"]} — same embedding path as the migration DDL.
+
+(def ^:private openapi-json
+  (delay
+    (let [url (io/resource "openapi.json")]
+      (when-not url
+        (throw (ex-info "openapi.json resource missing" {:resource "openapi.json"})))
+      (slurp url))))
+
+(defn openapi-doc
+  "GET {path_prefix}/openapi.json: the API contract as OpenAPI 3 JSON —
+   public, unauthenticated, constant content (a static document)."
+  [ctx request]
+  {:status 200
+   :headers {"Content-Type" "application/json"}
+   :body @openapi-json})
+
 ;; --- management /manage/v1 (admin token, Q27/Q52) ----------------------------
 
 (defn manage-stats
@@ -810,6 +831,7 @@
         p (:path_prefix cfg)]
     [[(str p "/healthz") {:kind :public :get #'healthz}]
      [(str p "/readyz") {:kind :public :get #'readyz}]
+     [(str p "/openapi.json") {:kind :public :get #'openapi-doc}]
      [items {:get #'list-items :post #'create-item}]
      [(str items "/:name") {:get #'get-item
                             :patch #'patch-item

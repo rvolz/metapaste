@@ -748,3 +748,31 @@
                 "no secret value anywhere in the config response"))
           (finally (storage/close-storage store))))
       (finally (delete-recursively! dir)))))
+
+;; --- OpenAPI document (served spec) -----------------------------------------
+
+(deftest openapi-json-served-unauthenticated
+  (let [dir (temp-dir)]
+    (try
+      (let [store (storage/open! dir)]
+        (try
+          (let [resp (call (health-handler store) :get "/openapi.json")]
+            (is (= 200 (:status resp)) (pr-str resp))
+            (is (= "application/json" (get-in resp [:headers "Content-Type"])))
+            (let [m (json/read-str (:body resp))]
+              (is (= "3.0.3" (get m "openapi")))
+              (is (= "metapaste v2 API" (get-in m ["info" "title"])))
+              (is (contains? (get m "paths") "/api/v1/items"))
+              (is (contains? (get m "paths") "/manage/v1/config"))))
+          (testing "POST -> 405 with Allow: GET"
+            (let [resp (call (health-handler store) :post "/openapi.json")]
+              (is (= 405 (:status resp)))
+              (is (= "GET" (get-in resp [:headers "Allow"])))))
+          (testing "route honors path_prefix"
+            (let [h (api/make-handler {:store store
+                                       :config (handler-cfg {:path_prefix "/mp"})
+                                       :multipart-parser (fn [_] nil)})]
+              (is (= 200 (:status (call h :get "/mp/openapi.json"))))
+              (is (= 404 (:status (call h :get "/openapi.json"))))))
+          (finally (storage/close-storage store))))
+      (finally (delete-recursively! dir)))))

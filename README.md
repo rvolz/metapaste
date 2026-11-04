@@ -10,7 +10,10 @@ Clojure on [jolt](https://github.com/jolt-lang/jolt) (Clojure on threaded Chez
 Scheme); `jolt build` produces a self-contained executable with no JVM.
 
 API contract: [`docs/openapi.yaml`](docs/openapi.yaml) (frozen — the summary
-below points at it for the authoritative shapes).
+below points at it for the authoritative shapes). The server publishes the
+same document as OpenAPI 3 JSON at `GET {path_prefix}/openapi.json` (public,
+no auth; `resources/openapi.json` is generated from the YAML by
+`scripts/gen-openapi-json.py` and baked into the binary).
 
 ## Quickstart — binary
 

@@ -22,7 +22,9 @@ Run `./scripts/test.sh` before finishing.
 - `test/` — `clojure.test` namespaces mirroring `src/`.
 - `scripts/run_tests.clj` — discovers `test/**/*_test.clj` automatically.
 - `docs/openapi.yaml` — FROZEN API contract; do not invent endpoints beyond
-  spec §5/§8.
+  spec §5/§8. Sanctioned infra exception: `GET {path_prefix}/openapi.json`
+  serves the frozen contract as JSON (`resources/openapi.json`, regenerated
+  from the YAML only via `scripts/gen-openapi-json.py`) — keep this route.
 
 ## Stack notes (jolt v0.8.20)
 
